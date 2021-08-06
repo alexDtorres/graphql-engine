@@ -8,108 +8,178 @@ module Hasura.RQL.DDL.Schema.Rename
   )
 where
 
+import           Hasura.Prelude
+
+import qualified Data.HashMap.Strict           as M
+import qualified Data.HashMap.Strict.InsOrd    as OMap
+import qualified Data.HashSet                  as Set
+import qualified Language.GraphQL.Draft.Syntax as G
+
 import           Control.Lens.Combinators
 import           Control.Lens.Operators
-import           Hasura.Backends.Postgres.SQL.Types
-import           Hasura.Prelude
+import           Data.Aeson
+import           Data.Text.Extended
+
+import qualified Hasura.SQL.AnyBackend         as AB
+
+import           Hasura.Base.Error
 import           Hasura.RQL.DDL.Permission
 import           Hasura.RQL.Types
 import           Hasura.Session
 
-import           Data.Aeson
-import           Data.Text.Extended
 
-import qualified Data.HashMap.Strict                as M
-import qualified Data.HashMap.Strict.InsOrd         as OMap
-import qualified Data.List.NonEmpty                 as NE
-import qualified Data.Set                           as Set
-import qualified Language.GraphQL.Draft.Syntax      as G
-
-data RenameItem a
+data RenameItem (b :: BackendType) a
   = RenameItem
-  { _riTable :: !QualifiedTable
+  { _riTable :: !(TableName b)
   , _riOld   :: !a
   , _riNew   :: !a
-  } deriving (Show, Eq)
+  }
 
-type RenameCol = RenameItem PGCol
-data RenameField
-  = RFCol !RenameCol
-  | RFRel !(RenameItem RelName)
-  deriving (Show, Eq)
+type RenameCol (b :: BackendType) = RenameItem b (Column b)
 
-type RenameTable = (QualifiedTable, QualifiedTable)
+data RenameField b
+  = RFCol !(RenameCol b)
+  | RFRel !(RenameItem b RelName)
 
-data Rename
-  = RTable !RenameTable
-  | RField !RenameField
-  deriving (Show, Eq)
+type RenameTable b = (TableName b, TableName b)
+
+data Rename b
+  = RTable !(RenameTable b)
+  | RField !(RenameField b)
 
 otherDeps :: QErrM m => Text -> SchemaObjId -> m ()
 otherDeps errMsg d =
-  throw500 $ "unexpected dependancy "
+  throw500 $ "unexpected dependency "
     <> reportSchemaObj d <> "; " <> errMsg
 
+-- | Replace all references to a given table name by its new name across the entire metadata.
+--
+-- This function will make use of the metadata dependency graph (see 'getDependentObjs') to identify
+-- all places that refer to the old table name, and replace it accordingly. Most operations will
+-- occur within the same source, such as table references in relationships and permissions.
+-- Dependencies across sources can happen in the case of cross-source relationships.
+--
+-- This function will fail if it encounters a nonsensical dependency; for instance, if there's a
+-- dependency from that table to a source.
+--
+-- For more information about the dependency graph, see 'SchemaObjId'.
 renameTableInMetadata
-  :: ( MonadError QErr m
+  :: forall b m
+   . ( MonadError QErr m
      , CacheRM m
      , MonadWriter MetadataModifier m
+     , BackendMetadata b
      )
-  => SourceName -> QualifiedTable -> QualifiedTable -> m ()
+  => SourceName
+  -> TableName b
+  -> TableName b
+  -> m ()
 renameTableInMetadata source newQT oldQT = do
   sc <- askSchemaCache
-  let allDeps = getDependentObjs sc $ SOSourceObj source $ SOITable oldQT
+  let allDeps = getDependentObjs sc
+                  $ SOSourceObj source
+                  $ AB.mkAnyBackend
+                  $ SOITable @b oldQT
 
   -- update all dependant schema objects
   forM_ allDeps $ \case
-    (SOSourceObj _ (SOITableObj refQT (TORel rn))) ->
-      updateRelDefs source refQT rn (oldQT, newQT)
-    (SOSourceObj _ (SOITableObj refQT (TOPerm rn pt)))   ->
-      updatePermFlds source refQT rn pt $ RTable (oldQT, newQT)
-    -- A trigger's definition is not dependent on the table directly
-    (SOSourceObj _ (SOITableObj _ (TOTrigger _)))   -> pure ()
-    -- A remote relationship's definition is not dependent on the table directly
-    (SOSourceObj _ (SOITableObj _ (TORemoteRel _))) -> pure ()
-
+    -- the dependend object is a source object in the same source
+    sobj@(SOSourceObj depSourceName exists)
+      | depSourceName == source
+      , Just sourceObjId <- AB.unpackAnyBackend @b exists
+      -> case sourceObjId of
+           SOITableObj refQT (TORel rn) ->
+             updateRelDefs @b source refQT rn (oldQT, newQT)
+           SOITableObj refQT (TOPerm rn pt) ->
+             updatePermFlds @b source refQT rn pt $ RTable (oldQT, newQT)
+           -- A trigger's definition is not dependent on the table directly
+           SOITableObj _ (TOTrigger _) -> pure ()
+           -- A remote relationship's definition is not dependent on the table directly
+           SOITableObj _ (TORemoteRel _) -> pure ()
+           _ -> otherDeps errMsg sobj
+    -- the dependend object is a source object in a different source
+    sobj@(SOSourceObj depSourceName exists) ->
+      AB.dispatchAnyBackend @BackendMetadata exists \(sourceObjId :: SourceObjId b') ->
+        case sourceObjId of
+          SOITableObj tableName (TORemoteRel remoteRelationshipName) -> do
+            updateTableInRemoteRelationshipRHS @b' @b depSourceName tableName remoteRelationshipName (oldQT, newQT)
+          -- only remote relationships might create dependencies across sources
+          _ -> otherDeps errMsg sobj
+    -- any other kind of dependent object (erroneous)
     d -> otherDeps errMsg d
   -- Update table name in metadata
-  tell $ MetadataModifier $ metaSources.ix source.smTables %~ \tables ->
+  tell $ MetadataModifier $ metaSources.ix source.(toSourceMetadata @b).smTables %~ \tables ->
     flip (maybe tables) (OMap.lookup oldQT tables) $
     \tableMeta -> OMap.delete oldQT $ OMap.insert newQT tableMeta{_tmTable = newQT} tables
   where
     errMsg = "cannot rename table " <> oldQT <<> " to " <>> newQT
 
+-- | Replace all references to a given column name by its new name across the entire metadata.
+--
+-- This function will make use of the metadata dependency graph (see 'getDependentObjs') to identify
+-- all places that refer to the old column name, and replace it accordingly. Most operations will
+-- occur within the same source, such as column references in relationships and permissions.
+-- Dependencies across sources can happen in the case of cross-source relationships.
+--
+-- This function will fail if it encounters a nonsensical dependency; for instance, if there's a
+-- dependency from that table to a source.
+--
+-- For more information about the dependency graph, see 'SchemaObjId'.
 renameColumnInMetadata
-  :: ( MonadError QErr m
+  :: forall b m
+   . ( MonadError QErr m
      , CacheRM m
      , MonadWriter MetadataModifier m
+     , BackendMetadata b
      )
-  => PGCol -> PGCol -> SourceName -> QualifiedTable -> FieldInfoMap (FieldInfo 'Postgres) -> m ()
+  => Column b -> Column b -> SourceName -> TableName b -> FieldInfoMap (FieldInfo b) -> m ()
 renameColumnInMetadata oCol nCol source qt fieldInfo = do
   sc <- askSchemaCache
   -- Check if any relation exists with new column name
   assertFldNotExists
   -- Fetch dependent objects
-  let depObjs = getDependentObjs sc $ SOSourceObj source $
-                SOITableObj qt $ TOCol oCol
-      renameFld = RFCol $ RenameItem qt oCol nCol
+  let depObjs = getDependentObjs sc
+                  $ SOSourceObj source
+                  $ AB.mkAnyBackend
+                  $ SOITableObj @b qt
+                  $ TOCol @b oCol
+      renameItem = RenameItem @b qt oCol nCol
+      renameFld  = RFCol renameItem
   -- Update dependent objects
   forM_ depObjs $ \case
-    (SOSourceObj _ (SOITableObj refQT (TOPerm role pt))) ->
-      updatePermFlds source refQT role pt $ RField renameFld
-    (SOSourceObj _ (SOITableObj refQT (TORel rn))) ->
-      updateColInRel source refQT rn $ RenameItem qt oCol nCol
-    (SOSourceObj _ (SOITableObj refQT (TOTrigger triggerName))) ->
-      updateColInEventTriggerDef source refQT triggerName $ RenameItem qt oCol nCol
-    (SOSourceObj _ (SOITableObj _ (TORemoteRel remoteRelName))) ->
-      updateColInRemoteRelationship source remoteRelName $ RenameItem qt oCol nCol
+    -- the dependend object is a source object in the same source
+    sobj@(SOSourceObj depSourceName exists)
+      | depSourceName == source
+      , Just sourceObjId <- AB.unpackAnyBackend @b exists
+      -> case sourceObjId of
+           SOITableObj refQT (TOPerm role pt) ->
+             updatePermFlds @b source refQT role pt $ RField renameFld
+           SOITableObj refQT (TORel rn) ->
+             updateColInRel @b source refQT rn renameItem
+           SOITableObj refQT (TOTrigger triggerName) ->
+             tell
+               $ MetadataModifier
+               $ tableMetadataSetter @b source refQT.tmEventTriggers.ix triggerName
+               %~ updateColumnInEventTrigger @b refQT oCol nCol qt
+           SOITableObj _ (TORemoteRel remoteRelName) ->
+             updateColInRemoteRelationshipLHS source remoteRelName renameItem
+           _ -> otherDeps errMsg sobj
+    -- the dependend object is a source object in a different source
+    sobj@(SOSourceObj depSourceName exists) ->
+      AB.dispatchAnyBackend @BackendMetadata exists \(sourceObjId :: SourceObjId b') ->
+        case sourceObjId of
+          SOITableObj tableName (TORemoteRel remoteRelationshipName) -> do
+            updateColInRemoteRelationshipRHS @b' @b depSourceName tableName remoteRelationshipName renameItem
+          -- only remote relationships might create dependencies across sources
+          _ -> otherDeps errMsg sobj
+    -- any other kind of dependent object (erroneous)
     d -> otherDeps errMsg d
   -- Update custom column names
-  possiblyUpdateCustomColumnNames source qt oCol nCol
+  possiblyUpdateCustomColumnNames @b source qt oCol nCol
   where
     errMsg = "cannot rename column " <> oCol <<> " to " <>> nCol
     assertFldNotExists =
-      case M.lookup (fromCol @'Postgres oCol) fieldInfo of
+      case M.lookup (fromCol @b oCol) fieldInfo of
         Just (FIRelationship _) ->
           throw400 AlreadyExists $ "cannot rename column " <> oCol
           <<> " to " <> nCol <<> " in table " <> qt <<>
@@ -117,22 +187,29 @@ renameColumnInMetadata oCol nCol source qt fieldInfo = do
         _ -> pure ()
 
 renameRelationshipInMetadata
-  :: ( MonadError QErr m
+  :: forall b m
+   . ( MonadError QErr m
      , CacheRM m
      , MonadWriter MetadataModifier m
+     , BackendMetadata b
      )
-  => SourceName -> QualifiedTable -> RelName -> RelType -> RelName -> m ()
+  => SourceName -> TableName b -> RelName -> RelType -> RelName -> m ()
 renameRelationshipInMetadata source qt oldRN relType newRN = do
   sc <- askSchemaCache
-  let depObjs = getDependentObjs sc $ SOSourceObj source $
-                SOITableObj qt $ TORel oldRN
-      renameFld = RFRel $ RenameItem qt oldRN newRN
+  let depObjs = getDependentObjs sc
+                  $ SOSourceObj source
+                  $ AB.mkAnyBackend
+                  $ SOITableObj @b qt
+                  $ TORel oldRN
+      renameFld = RFRel $ RenameItem @b qt oldRN newRN
 
   forM_ depObjs $ \case
-    (SOSourceObj _ (SOITableObj refQT (TOPerm role pt))) ->
-      updatePermFlds source refQT role pt $ RField renameFld
+    sobj@(SOSourceObj _ exists) -> case AB.unpackAnyBackend @b exists of
+      Just (SOITableObj refQT (TOPerm role pt)) ->
+        updatePermFlds @b source refQT role pt $ RField renameFld
+      _ -> otherDeps errMsg sobj
     d -> otherDeps errMsg d
-  tell $ MetadataModifier $ tableMetadataSetter source qt %~ case relType of
+  tell $ MetadataModifier $ tableMetadataSetter @b source qt %~ case relType of
     ObjRel -> tmObjectRelationships %~ rewriteRelationships
     ArrRel -> tmArrayRelationships  %~ rewriteRelationships
   where
@@ -145,48 +222,52 @@ renameRelationshipInMetadata source qt oldRN relType newRN = do
 
 -- update table names in relationship definition
 updateRelDefs
-  :: ( MonadError QErr m
+  :: forall b m
+   . ( MonadError QErr m
      , CacheRM m
      , MonadWriter MetadataModifier m
+     , BackendMetadata b
      )
-  => SourceName -> QualifiedTable -> RelName -> RenameTable -> m ()
+  => SourceName -> TableName b -> RelName -> RenameTable b -> m ()
 updateRelDefs source qt rn renameTable = do
-  fim <- askFieldInfoMap source qt
+  fim <- askFieldInfoMap @b source qt
   ri <- askRelType fim rn ""
   tell $ MetadataModifier $ tableMetadataSetter source qt %~ case riType ri of
     ObjRel -> tmObjectRelationships.ix rn %~ updateObjRelDef renameTable
     ArrRel -> tmArrayRelationships.ix rn %~ updateArrRelDef renameTable
   where
-    updateObjRelDef :: RenameTable -> ObjRelDef -> ObjRelDef
+    updateObjRelDef :: RenameTable b -> ObjRelDef b -> ObjRelDef b
     updateObjRelDef (oldQT, newQT) =
       rdUsing %~ \case
       RUFKeyOn fk -> RUFKeyOn fk
-      RUManual (RelManualConfig origQT rmCols) ->
+      RUManual (RelManualConfig origQT rmCols rmIO) ->
         let updQT = bool origQT newQT $ oldQT == origQT
-        in RUManual $ RelManualConfig updQT rmCols
+        in RUManual $ RelManualConfig updQT rmCols rmIO
 
-    updateArrRelDef :: RenameTable -> ArrRelDef -> ArrRelDef
+    updateArrRelDef :: RenameTable b -> ArrRelDef b -> ArrRelDef b
     updateArrRelDef (oldQT, newQT) =
       rdUsing %~ \case
       RUFKeyOn (ArrRelUsingFKeyOn origQT c) ->
         let updQT = getUpdQT origQT
         in RUFKeyOn $ ArrRelUsingFKeyOn updQT c
-      RUManual (RelManualConfig origQT rmCols) ->
+      RUManual (RelManualConfig origQT rmCols rmIO) ->
         let updQT = getUpdQT origQT
-        in RUManual $ RelManualConfig updQT rmCols
+        in RUManual $ RelManualConfig updQT rmCols rmIO
       where
         getUpdQT origQT = bool origQT newQT $ oldQT == origQT
 
--- | update fields in premissions
+-- | update fields in permissions
 updatePermFlds
-  :: ( MonadError QErr m
+  :: forall b m
+   . ( MonadError QErr m
      , CacheRM m
      , MonadWriter MetadataModifier m
+     , BackendMetadata b
      )
-  => SourceName -> QualifiedTable -> RoleName -> PermType -> Rename -> m ()
+  => SourceName -> TableName b -> RoleName -> PermType -> Rename b -> m ()
 updatePermFlds source refQT rn pt rename = do
-  tables <- getSourceTables source
-  let withTables :: Reader (TableCache 'Postgres) a -> a
+  tables <- askTableCache source
+  let withTables :: Reader (TableCache b) a -> a
       withTables = flip runReader tables
   tell $ MetadataModifier $
     tableMetadataSetter source refQT %~ case pt of
@@ -204,8 +285,8 @@ updatePermFlds source refQT rn pt rename = do
           withTables $ updateDelPermFlds refQT rename delPerm
 
 updateInsPermFlds
-  :: (MonadReader (TableCache 'Postgres) m)
-  => QualifiedTable -> Rename -> InsPerm 'Postgres -> m (InsPerm 'Postgres)
+  :: (MonadReader (TableCache b) m, Backend b)
+  => TableName b -> Rename b -> InsPerm b -> m (InsPerm b)
 updateInsPermFlds refQT rename (InsPerm chk preset cols mBackendOnly) =
   case rename of
     RTable rt -> do
@@ -218,8 +299,8 @@ updateInsPermFlds refQT rename (InsPerm chk preset cols mBackendOnly) =
       pure $ InsPerm updChk updPresetM updColsM mBackendOnly
 
 updateSelPermFlds
-  :: (MonadReader (TableCache 'Postgres) m)
-  => QualifiedTable -> Rename -> SelPerm 'Postgres -> m (SelPerm 'Postgres)
+  :: (MonadReader (TableCache b) m, Backend b)
+  => TableName b -> Rename b -> SelPerm b -> m (SelPerm b)
 updateSelPermFlds refQT rename (SelPerm cols fltr limit aggAllwd computedFields) = do
   case rename of
     RTable rt -> do
@@ -231,8 +312,8 @@ updateSelPermFlds refQT rename (SelPerm cols fltr limit aggAllwd computedFields)
       pure $ SelPerm updCols updFltr limit aggAllwd computedFields
 
 updateUpdPermFlds
-  :: (MonadReader (TableCache 'Postgres) m)
-  => QualifiedTable -> Rename -> UpdPerm 'Postgres -> m (UpdPerm 'Postgres)
+  :: (MonadReader (TableCache b) m, Backend b)
+  => TableName b -> Rename b -> UpdPerm b -> m (UpdPerm b)
 updateUpdPermFlds refQT rename (UpdPerm cols preset fltr check) = do
   case rename of
     RTable rt -> do
@@ -247,15 +328,16 @@ updateUpdPermFlds refQT rename (UpdPerm cols preset fltr check) = do
       pure $ UpdPerm updCols updPresetM updFltr updCheck
 
 updateDelPermFlds
-  :: (MonadReader (TableCache 'Postgres) m)
-  => QualifiedTable -> Rename -> DelPerm 'Postgres -> m (DelPerm 'Postgres)
+  :: (MonadReader (TableCache b) m, Backend b)
+  => TableName b -> Rename b -> DelPerm b -> m (DelPerm b)
 updateDelPermFlds refQT rename (DelPerm fltr) = do
   DelPerm <$> case rename of
     RTable rt -> pure $ updateTableInBoolExp rt fltr
     RField rf -> updateFieldInBoolExp refQT rf fltr
 
 updatePreset
-  :: QualifiedTable -> RenameField -> (ColumnValues Value) -> (ColumnValues Value)
+  :: (Backend b)
+  => TableName b -> RenameField b -> ColumnValues b Value -> ColumnValues b Value
 updatePreset qt rf obj =
    case rf of
      RFCol (RenameItem opQT oCol nCol) ->
@@ -274,7 +356,7 @@ updatePreset qt rf obj =
           in (updCol, v)
 
 updateCols
-  :: QualifiedTable -> RenameField -> PermColSpec -> PermColSpec
+  :: (Backend b) => TableName b -> RenameField b -> PermColSpec b -> PermColSpec b
 updateCols qt rf permSpec =
   case rf of
     RFCol (RenameItem opQT oCol nCol) ->
@@ -287,21 +369,21 @@ updateCols qt rf permSpec =
       PCCols c -> PCCols $ flip map c $
         \col -> if col == oCol then nCol else col
 
-updateTableInBoolExp :: RenameTable -> BoolExp 'Postgres -> BoolExp 'Postgres
+updateTableInBoolExp :: (Backend b) => RenameTable b -> BoolExp b -> BoolExp b
 updateTableInBoolExp (oldQT, newQT) =
   over _Wrapped . transform $ (_BoolExists . geTable) %~ \rqfQT ->
     if rqfQT == oldQT then newQT else rqfQT
 
 updateFieldInBoolExp
-  :: (MonadReader (TableCache 'Postgres) m)
-  => QualifiedTable -> RenameField -> BoolExp 'Postgres -> m (BoolExp 'Postgres)
+  :: (MonadReader (TableCache b) m, Backend b)
+  => TableName b -> RenameField b -> BoolExp b -> m (BoolExp b)
 updateFieldInBoolExp qt rf be = BoolExp <$>
   case unBoolExp be of
     BoolAnd exps -> BoolAnd <$> procExps exps
     BoolOr  exps -> BoolOr <$> procExps exps
     BoolNot e    -> BoolNot <$> updateBoolExp' e
     BoolExists (GExists refqt wh) ->
-      (BoolExists . GExists refqt . unBoolExp)
+      BoolExists . GExists refqt . unBoolExp
       <$> updateFieldInBoolExp refqt rf (BoolExp wh)
     BoolFld fld  -> BoolFld <$> updateColExp qt rf fld
   where
@@ -310,8 +392,8 @@ updateFieldInBoolExp qt rf be = BoolExp <$>
       fmap unBoolExp . updateFieldInBoolExp qt rf . BoolExp
 
 updateColExp
-  :: (MonadReader (TableCache 'Postgres) m)
-  => QualifiedTable -> RenameField -> ColExp -> m ColExp
+  :: forall b m. (MonadReader (TableCache b) m, Backend b)
+  => TableName b -> RenameField b -> ColExp -> m ColExp
 updateColExp qt rf (ColExp fld val) =
   ColExp updatedFld <$> updatedVal
   where
@@ -334,126 +416,215 @@ updateColExp qt rf (ColExp fld val) =
           FIRemoteRelationship{} -> pure val
 
     (oFld, nFld, opQT) = case rf of
-      RFCol (RenameItem tn oCol nCol) -> (fromCol @'Postgres oCol, fromCol @'Postgres nCol, tn)
+      RFCol (RenameItem tn oCol nCol) -> (fromCol @b oCol, fromCol @b nCol, tn)
       RFRel (RenameItem tn oRel nRel) -> (fromRel oRel, fromRel nRel, tn)
 
 -- rename columns in relationship definitions
 updateColInRel
-  :: (CacheRM m, MonadWriter MetadataModifier m)
-  => SourceName -> QualifiedTable -> RelName -> RenameCol -> m ()
+  :: forall b m
+   . (CacheRM m, MonadWriter MetadataModifier m, BackendMetadata b)
+  => SourceName -> TableName b -> RelName -> RenameCol b -> m ()
 updateColInRel source fromQT rn rnCol = do
-  tables <- getSourceTables source
+  tables <- askSourceTables @b source
   let maybeRelInfo =
         tables ^? ix fromQT.tiCoreInfo.tciFieldInfoMap.ix (fromRel rn)._FIRelationship
   forM_ maybeRelInfo $ \relInfo ->
-    tell $ MetadataModifier $ tableMetadataSetter source fromQT %~
-    case riType relInfo of
-      ObjRel -> tmObjectRelationships.ix rn.rdUsing %~
-                updateColInObjRel fromQT (riRTable relInfo) rnCol
-      ArrRel -> tmArrayRelationships.ix rn.rdUsing %~
-                updateColInArrRel fromQT (riRTable relInfo) rnCol
+    let relTableName = riRTable relInfo
+    in tell $ MetadataModifier $ tableMetadataSetter source fromQT %~
+      case riType relInfo of
+        ObjRel -> tmObjectRelationships.ix rn.rdUsing %~
+                  updateColInObjRel fromQT relTableName rnCol
+        ArrRel -> tmArrayRelationships.ix rn.rdUsing %~
+                  updateColInArrRel fromQT relTableName rnCol
 
-updateColInRemoteRelationship
-  :: ( MonadError QErr m
+-- | Local helper: update a column's name in the left-hand side of a remote relationship.
+--
+-- There are two kinds or remote relationships: remote source relationships, across sources, and
+-- remote schema relationships, on remote schemas. In both cases, we maintain a mapping from the
+-- source table's colunns to what they should be joined against in the target; when a column is
+-- renamed, those references must be renamed as well. This function handles both cases.
+--
+-- See 'renameColumnInMetadata'.
+updateColInRemoteRelationshipLHS
+  :: forall b m
+   . ( MonadError QErr m
      , MonadWriter MetadataModifier m
+     , BackendMetadata b
      )
-  => SourceName -> RemoteRelationshipName -> RenameCol -> m ()
-updateColInRemoteRelationship source remoteRelationshipName renameCol = do
-  oldColName <- parseGraphQLName $ getPGColTxt oldCol
-  newColName <- parseGraphQLName $ getPGColTxt newCol
-  tell $ MetadataModifier $
-    tableMetadataSetter source qt.tmRemoteRelationships.ix remoteRelationshipName.rrmDefinition %~
-      (rrdHasuraFields %~ modifyHasuraFields) .
-      (rrdRemoteField %~ modifyFieldCalls oldColName newColName)
+  => SourceName -> RemoteRelationshipName -> RenameCol b -> m ()
+updateColInRemoteRelationshipLHS source remoteRelationshipName (RenameItem qt oldCol newCol) = do
+  oldColName <- parseGraphQLName $ toTxt oldCol
+  newColName <- parseGraphQLName $ toTxt newCol
+  let
+    oldFieldName = fromCol @b oldCol
+    newFieldName = fromCol @b newCol
+
+    updateSet =
+      Set.insert newFieldName . Set.delete oldFieldName
+
+    updateMapKey =
+      -- mapKeys is not available in 0.2.13.0
+      M.fromList . map (\(key, value) -> (if key == oldFieldName then newFieldName else key, value)) . M.toList
+
+    updateFieldCalls (RemoteFields fields) =
+      RemoteFields $ fields <&> \(FieldCall name (RemoteArguments args)) ->
+        FieldCall name $ RemoteArguments $ updateVariableName <$> args
+
+    updateVariableName =
+      fmap \v -> if v == oldColName then newColName else v
+
+    remoteRelationshipLens =
+      tableMetadataSetter @b source qt.tmRemoteRelationships.ix remoteRelationshipName.rrmDefinition
+
+    remoteSchemaLHSModifier =
+      remoteRelationshipLens._RemoteSchemaRelDef._2 %~
+      (rrdHasuraFields %~ updateSet) .
+      (rrdRemoteField  %~ updateFieldCalls)
+
+    remoteSourceLHSModifier =
+      remoteRelationshipLens._RemoteSourceRelDef.rsrFieldMapping %~ updateMapKey
+
+  tell $ MetadataModifier $ remoteSchemaLHSModifier . remoteSourceLHSModifier
+
   where
-    (RenameItem qt oldCol newCol) = renameCol
-    modifyHasuraFields = Set.insert (fromCol @'Postgres newCol) . Set.delete (fromCol @'Postgres oldCol)
-    modifyFieldCalls oldColName newColName =
-      RemoteFields
-      . NE.map (\(FieldCall name args) ->
-                   let remoteArgs = getRemoteArguments args
-                   in FieldCall name $ RemoteArguments $
+    parseGraphQLName txt = G.mkName txt
+      `onNothing` throw400 ParseFailed (txt <> " is not a valid GraphQL name")
 
-                                      fmap (replaceVariableName oldColName newColName) remoteArgs
-               )
-      . unRemoteFields
-
-    parseGraphQLName txt = onNothing (G.mkName txt) $ throw400 ParseFailed errMsg
-      where
-        errMsg = txt <> " is not a valid GraphQL name"
-
-    replaceVariableName :: G.Name -> G.Name -> G.Value G.Name -> G.Value G.Name
-    replaceVariableName oldColName newColName = \case
-      G.VVariable oldColName' ->
-        G.VVariable $ bool oldColName newColName $ oldColName == oldColName'
-      G.VList values -> G.VList $ map (replaceVariableName oldColName newColName) values
-      G.VObject values ->
-        G.VObject $ fmap (replaceVariableName oldColName newColName) values
-      v -> v
-
--- rename columns in relationship definitions
-updateColInEventTriggerDef
-  :: (MonadWriter MetadataModifier m)
-  => SourceName -> QualifiedTable -> TriggerName -> RenameCol -> m ()
-updateColInEventTriggerDef source table trigName rnCol =
+-- | Local helper: update a column's name in the right-hand side of a remote relationship.
+--
+-- In the case of remote _source_ relationships, the mapping from column to column needs to be
+-- updated if one of the rhs columns has been renamed. A dependency is tracked from the rhs source's
+-- column to the lhs source's relationship: when a rhs source's column has been renamed, this
+-- function performs the corresponding update in the lhs source's relationship definition.
+--
+-- See 'renameColumnInMetadata'.
+updateColInRemoteRelationshipRHS
+  :: forall source target m
+   . ( MonadWriter MetadataModifier m
+     , BackendMetadata source
+     , BackendMetadata target
+     )
+  => SourceName
+  -> TableName source
+  -> RemoteRelationshipName
+  -> RenameCol target
+  -> m ()
+updateColInRemoteRelationshipRHS source tableName remoteRelationshipName (RenameItem _ oldCol newCol) =
   tell $ MetadataModifier $
-    tableMetadataSetter source table.tmEventTriggers.ix trigName %~ rewriteEventTriggerConf
+    tableMetadataSetter @source source tableName.
+    tmRemoteRelationships.
+    ix remoteRelationshipName.
+    rrmDefinition.
+    _RemoteSourceRelDef.
+    rsrFieldMapping %~ updateMapValue
   where
-    rewriteSubsCols = \case
-      SubCStar       -> SubCStar
-      SubCArray cols -> SubCArray $
-                        map (getNewCol rnCol table) cols
-    rewriteOpSpec (SubscribeOpSpec cols payload) =
-      SubscribeOpSpec
-      (rewriteSubsCols cols)
-      (rewriteSubsCols <$> payload)
-    rewriteTrigOpsDef (TriggerOpsDef ins upd del man) =
-      TriggerOpsDef
-      (rewriteOpSpec <$> ins)
-      (rewriteOpSpec <$> upd)
-      (rewriteOpSpec <$> del)
-      man
-    rewriteEventTriggerConf etc =
-      etc { etcDefinition =
-            rewriteTrigOpsDef $ etcDefinition etc
-          }
+    oldFieldName = fromCol @target oldCol
+    newFieldName = fromCol @target newCol
+    updateMapValue =
+      fmap \value -> if value == oldFieldName then newFieldName else value
+
+-- | Local helper: update a table's name in the right-hand side of a remote relationship.
+--
+-- In the case of remote _source_ relationships, the relationship definition targets a specific
+-- table in the rhs source, and that reference needs to be updated if the targeted table has been
+-- renamed. A dependency is tracked from the rhs source's table to the lhs source's relationship:
+-- when a rhs table has been renamed, this function performs the corresponding update in the lhs
+-- source's relationship definition.
+--
+-- See 'renameTableInMetadata'.
+updateTableInRemoteRelationshipRHS
+  :: forall source target m
+   . ( MonadWriter MetadataModifier m
+     , BackendMetadata source
+     , BackendMetadata target
+     )
+  => SourceName
+  -> TableName source
+  -> RemoteRelationshipName
+  -> RenameTable target
+  -> m ()
+updateTableInRemoteRelationshipRHS source tableName remoteRelationshipName (_, newTableName) =
+  tell $ MetadataModifier $
+    tableMetadataSetter @source source tableName.
+    tmRemoteRelationships.
+    ix remoteRelationshipName.
+    rrmDefinition.
+    _RemoteSourceRelDef.
+    rsrTable .~ toJSON newTableName
 
 updateColInObjRel
-  :: QualifiedTable -> QualifiedTable
-  -> RenameCol -> ObjRelUsing -> ObjRelUsing
+  :: (Backend b)
+  => TableName b -> TableName b -> RenameCol b -> ObjRelUsing b -> ObjRelUsing b
 updateColInObjRel fromQT toQT rnCol = \case
-  RUFKeyOn col -> RUFKeyOn $ getNewCol rnCol fromQT col
-  RUManual manConfig -> RUManual $ updateRelManualConfig fromQT toQT rnCol manConfig
+  RUFKeyOn c         ->
+    RUFKeyOn $ updateRelChoice fromQT toQT rnCol c
+  RUManual manConfig ->
+    RUManual $ updateRelManualConfig fromQT toQT rnCol manConfig
+
+updateRelChoice
+  :: Backend b
+  => TableName b
+  -> TableName b
+  -> RenameCol b
+  -> ObjRelUsingChoice b
+  -> ObjRelUsingChoice b
+updateRelChoice fromQT toQT rnCol =
+  \case
+    SameTable col   -> SameTable $ getNewCol rnCol fromQT col
+    RemoteTable t c -> RemoteTable t (getNewCol rnCol toQT c)
 
 updateColInArrRel
-  :: QualifiedTable -> QualifiedTable
-  -> RenameCol -> ArrRelUsing -> ArrRelUsing
+  :: (Backend b)
+  => TableName b -> TableName b -> RenameCol b -> ArrRelUsing b -> ArrRelUsing b
 updateColInArrRel fromQT toQT rnCol = \case
   RUFKeyOn (ArrRelUsingFKeyOn t c) ->
     let updCol = getNewCol rnCol toQT c
     in RUFKeyOn $ ArrRelUsingFKeyOn t updCol
   RUManual manConfig -> RUManual $ updateRelManualConfig fromQT toQT rnCol manConfig
 
-type ColMap = HashMap PGCol PGCol
+type ColMap b = HashMap (Column b) (Column b)
 
 getNewCol
-  :: RenameCol -> QualifiedTable -> PGCol -> PGCol
-getNewCol rnCol qt col =
-  if opQT == qt && col == oCol then nCol else col
+  :: forall b f
+   . Backend b
+  => Functor f
+  => RenameCol b
+  -> TableName b
+  -> f (Column b)
+  -> f (Column b)
+getNewCol rnCol qt cols =
+  if qt == opQT then
+    go <$> cols
+  else
+    cols
   where
     RenameItem opQT oCol nCol = rnCol
+    go :: Column b -> Column b
+    go col
+      | col == oCol = nCol
+      | otherwise   = col
 
 updateRelManualConfig
-  :: QualifiedTable -> QualifiedTable
-  -> RenameCol -> RelManualConfig -> RelManualConfig
+  :: forall b
+   . (Backend b)
+  => TableName b
+  -> TableName b
+  -> RenameCol b
+  -> RelManualConfig b
+  -> RelManualConfig b
 updateRelManualConfig fromQT toQT rnCol manConfig =
-  RelManualConfig tn $ updateColMap fromQT toQT rnCol colMap
+  RelManualConfig tn (updateColMap fromQT toQT rnCol colMap) io
   where
-    RelManualConfig tn colMap = manConfig
+    RelManualConfig tn colMap io = manConfig
 
 updateColMap
-  :: QualifiedTable -> QualifiedTable
-  -> RenameCol -> ColMap -> ColMap
+  :: forall b
+   . (Backend b)
+  => TableName b
+  -> TableName b
+  -> RenameCol b
+  -> ColMap b
+  -> ColMap b
 updateColMap fromQT toQT rnCol =
   M.fromList . map (modCol fromQT *** modCol toQT) . M.toList
   where
@@ -461,15 +632,16 @@ updateColMap fromQT toQT rnCol =
     modCol colQt col = if colQt == qt && col == oCol then nCol else col
 
 possiblyUpdateCustomColumnNames
-  :: MonadWriter MetadataModifier m
-  => SourceName -> QualifiedTable -> PGCol -> PGCol -> m ()
+  :: forall b m
+   .(MonadWriter MetadataModifier m, BackendMetadata b)
+  => SourceName
+  -> TableName b
+  -> Column b
+  -> Column b
+  -> m ()
 possiblyUpdateCustomColumnNames source qt oCol nCol = do
   let updateCustomColumns customColumns =
         M.fromList $ flip map (M.toList customColumns) $
         \(dbCol, val) -> (, val) $ if dbCol == oCol then nCol else dbCol
   tell $ MetadataModifier $
-    tableMetadataSetter source qt.tmConfiguration.tcCustomColumnNames %~ updateCustomColumns
-
-getSourceTables :: CacheRM m => SourceName -> m (TableCache 'Postgres)
-getSourceTables source =
-  (maybe mempty _pcTables . M.lookup source . scPostgres) <$> askSchemaCache
+    tableMetadataSetter @b source qt.tmConfiguration.tcCustomColumnNames %~ updateCustomColumns

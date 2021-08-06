@@ -1,7 +1,6 @@
 -- As of GHC 8.6, a use of DefaultSignatures in this module triggers a false positive for this
 -- warning, so don’t treat it as an error even if -Werror is enabled.
 {-# OPTIONS_GHC -Wwarn=redundant-constraints #-}
-
 {-# LANGUAGE UndecidableInstances #-}
 
 module Hasura.RQL.Types.SchemaCache
@@ -12,12 +11,15 @@ module Hasura.RQL.Types.SchemaCache
   , TableConfig(..)
   , emptyTableConfig
   , getAllRemoteSchemas
-  , getPGFunctionInfo
-  , getPGTableInfo
+  , unsafeFunctionCache
+  , unsafeFunctionInfo
+  , unsafeTableCache
+  , unsafeTableInfo
 
   , TableCoreCache
   , TableCache
   , ActionCache
+  , InheritedRolesCache
 
   , TypeRelationship(..)
   , trName, trType, trRemoteTable, trFieldMapping
@@ -42,14 +44,18 @@ module Hasura.RQL.Types.SchemaCache
 
   , ViewInfo(..)
   , isMutable
-  , mutableView
 
   , IntrospectionResult(..)
   , ParsedIntrospection(..)
+  , RemoteSchemaCustomizer(..)
+  , remoteSchemaCustomizeTypeName
+  , remoteSchemaCustomizeFieldName
+  , remoteSchemaDecustomizeTypeName
+  , remoteSchemaDecustomizeFieldName
   , RemoteSchemaCtx(..)
   , rscName
   , rscInfo
-  , rscIntro
+  , rscIntroOriginal
   , rscParsed
   , rscRawIntrospectionResult
   , rscPermissions
@@ -80,12 +86,6 @@ module Hasura.RQL.Types.SchemaCache
   , isPGColInfo
   , RelInfo(..)
 
-  , RolePermInfo(..)
-  , mkRolePermInfo
-  , permIns
-  , permSel
-  , permUpd
-  , permDel
   , PermAccessor(..)
   , permAccToLens
   , permAccToType
@@ -93,8 +93,6 @@ module Hasura.RQL.Types.SchemaCache
   , RolePermInfoMap
 
   , InsPermInfo(..)
-  , SelPermInfo(..)
-  , getSelectPermissionInfoM
   , UpdPermInfo(..)
   , DelPermInfo(..)
   , PreSetColsPartial
@@ -120,76 +118,117 @@ module Hasura.RQL.Types.SchemaCache
 --  , FunctionName(..)
   , FunctionInfo(..)
   , FunctionCache
-  , getFuncsOfTable
-  , askFunctionInfo
   , CronTriggerInfo(..)
-  ) where
 
-import           Control.Lens                        (makeLenses)
+  , MetadataResourceVersion(..)
+  , initialResourceVersion
+  , getBoolExpDeps
+  ) where
 
 import           Hasura.Prelude
 
-import qualified Data.ByteString.Lazy                as BL
-import qualified Data.HashMap.Strict                 as M
-import qualified Data.HashSet                        as HS
-import qualified Language.GraphQL.Draft.Syntax       as G
+import qualified Data.ByteString.Lazy                        as BL
+import qualified Data.HashMap.Strict                         as M
+import qualified Data.HashSet                                as HS
+import qualified Language.GraphQL.Draft.Syntax               as G
 
+import           Control.Lens                                (makeLenses)
 import           Data.Aeson
-import           Data.Aeson.Casing
 import           Data.Aeson.TH
+import           Data.Int                                    (Int64)
 import           Data.Text.Extended
 import           System.Cron.Types
 
-import qualified Hasura.GraphQL.Parser               as P
+import qualified Hasura.Backends.Postgres.Connection         as PG
+import qualified Hasura.GraphQL.Parser                       as P
+import qualified Hasura.SQL.AnyBackend                       as AB
 
-import           Hasura.Backends.Postgres.Connection
-import           Hasura.Backends.Postgres.SQL.Types  (PGCol, QualifiedFunction, QualifiedTable)
-import           Hasura.GraphQL.Context              (GQLContext, RemoteField, RoleContext)
-import           Hasura.Incremental                  (Cacheable, Dependency, MonadDepend (..),
-                                                      selectKeyD)
+import           Hasura.Base.Error
+import           Hasura.GraphQL.Context                      (GQLContext, RoleContext)
+import           Hasura.Incremental                          (Cacheable, Dependency,
+                                                              MonadDepend (..), selectKeyD)
 import           Hasura.RQL.IR.BoolExp
 import           Hasura.RQL.Types.Action
-import           Hasura.RQL.Types.Common             hiding (FunctionName)
+import           Hasura.RQL.Types.ApiLimit
+import           Hasura.RQL.Types.Backend
+import           Hasura.RQL.Types.Column
+import           Hasura.RQL.Types.Common
 import           Hasura.RQL.Types.ComputedField
 import           Hasura.RQL.Types.CustomTypes
-import           Hasura.RQL.Types.Error
+import           Hasura.RQL.Types.Endpoint
 import           Hasura.RQL.Types.EventTrigger
 import           Hasura.RQL.Types.Function
-import           Hasura.RQL.Types.Metadata
+import           Hasura.RQL.Types.GraphqlSchemaIntrospection
+import           Hasura.RQL.Types.Metadata.Object
 import           Hasura.RQL.Types.QueryCollection
+import           Hasura.RQL.Types.QueryTags
+import           Hasura.RQL.Types.Relationship
 import           Hasura.RQL.Types.RemoteSchema
 import           Hasura.RQL.Types.ScheduledTrigger
 import           Hasura.RQL.Types.SchemaCacheTypes
 import           Hasura.RQL.Types.Source
 import           Hasura.RQL.Types.Table
 import           Hasura.Session
-import           Hasura.SQL.Backend
-import           Hasura.Tracing                      (TraceT)
+import           Hasura.Tracing                              (TraceT)
 
+
+newtype MetadataResourceVersion
+  = MetadataResourceVersion
+  { getMetadataResourceVersion :: Int64
+  } deriving (Show, Eq, Num, FromJSON, ToJSON)
+
+initialResourceVersion :: MetadataResourceVersion
+initialResourceVersion = MetadataResourceVersion 0
 
 reportSchemaObjs :: [SchemaObjId] -> Text
 reportSchemaObjs = commaSeparated . sort . map reportSchemaObj
 
-mkParentDep :: SourceName -> QualifiedTable -> SchemaDependency
-mkParentDep s tn = SchemaDependency (SOSourceObj s $ SOITable tn) DRTable
+mkParentDep
+  :: forall b
+   . Backend b
+  => SourceName
+  -> TableName b
+  -> SchemaDependency
+mkParentDep s tn =
+  SchemaDependency (SOSourceObj s $ AB.mkAnyBackend @b (SOITable tn)) DRTable
 
-mkColDep :: DependencyReason -> SourceName -> QualifiedTable -> PGCol -> SchemaDependency
+mkColDep
+  :: forall b
+  . (Backend b)
+  => DependencyReason
+  -> SourceName
+  -> TableName b
+  -> Column b
+  -> SchemaDependency
 mkColDep reason source tn col =
-  flip SchemaDependency reason . SOSourceObj source . SOITableObj tn $ TOCol col
+  flip SchemaDependency reason
+    . SOSourceObj source
+    . AB.mkAnyBackend
+    . SOITableObj @b tn
+    $ TOCol @b col
 
 mkComputedFieldDep
-  :: DependencyReason -> SourceName -> QualifiedTable -> ComputedFieldName -> SchemaDependency
+  :: forall b. (Backend b)
+  => DependencyReason
+  -> SourceName
+  -> TableName b
+  -> ComputedFieldName
+  -> SchemaDependency
 mkComputedFieldDep reason s tn computedField =
-  flip SchemaDependency reason . SOSourceObj s . SOITableObj tn $ TOComputedField computedField
+  flip SchemaDependency reason
+    . SOSourceObj s
+    . AB.mkAnyBackend
+    . SOITableObj @b tn
+    $ TOComputedField computedField
 
 type WithDeps a = (a, [SchemaDependency])
 
 data IntrospectionResult
   = IntrospectionResult
-  { irDoc              :: RemoteSchemaIntrospection
-  , irQueryRoot        :: G.Name
-  , irMutationRoot     :: Maybe G.Name
-  , irSubscriptionRoot :: Maybe G.Name
+  { irDoc              :: !RemoteSchemaIntrospection
+  , irQueryRoot        :: !G.Name
+  , irMutationRoot     :: !(Maybe G.Name)
+  , irSubscriptionRoot :: !(Maybe G.Name)
   } deriving (Show, Eq, Generic)
 instance Cacheable IntrospectionResult
 
@@ -204,21 +243,22 @@ data ParsedIntrospection
 data RemoteSchemaCtx
   = RemoteSchemaCtx
   { _rscName                   :: !RemoteSchemaName
-  , _rscIntro                  :: !IntrospectionResult
+  , _rscIntroOriginal          :: !IntrospectionResult -- ^ Original remote schema without customizations
   , _rscInfo                   :: !RemoteSchemaInfo
   , _rscRawIntrospectionResult :: !BL.ByteString
-  -- ^ The raw response from the introspection query against the remote server.
+  -- ^ The raw response from the introspection query against the remote server,
+  -- or the serialized customized introspection result if there are schema customizations.
   -- We store this so we can efficiently service 'introspect_remote_schema'.
-  , _rscParsed                 ::  ParsedIntrospection
+  , _rscParsed                 ::  ParsedIntrospection -- ^ FieldParsers with schema customizations applied
   , _rscPermissions            :: !(M.HashMap RoleName IntrospectionResult)
   }
 $(makeLenses ''RemoteSchemaCtx)
 
 instance ToJSON RemoteSchemaCtx where
-  toJSON (RemoteSchemaCtx name _ info _ _ _) =
+  toJSON RemoteSchemaCtx {..} =
     object $
-      [ "name" .= name
-      , "info" .= toJSON info
+      [ "name" .= _rscName
+      , "info" .= toJSON _rscInfo
       ]
 
 type RemoteSchemaMap = M.HashMap RemoteSchemaName RemoteSchemaCtx
@@ -236,7 +276,7 @@ data CronTriggerInfo
    , ctiComment     :: !(Maybe Text)
    } deriving (Show, Eq)
 
-$(deriveToJSON (aesonDrop 3 snakeCase) ''CronTriggerInfo)
+$(deriveToJSON hasuraJSON ''CronTriggerInfo)
 
 newtype SchemaCacheVer
   = SchemaCacheVer { unSchemaCacheVer :: Word64 }
@@ -249,39 +289,72 @@ incSchemaCacheVer :: SchemaCacheVer -> SchemaCacheVer
 incSchemaCacheVer (SchemaCacheVer prev) =
   SchemaCacheVer $ prev + 1
 
-type ActionCache = M.HashMap ActionName (ActionInfo 'Postgres) -- info of all actions
+type ActionCache = M.HashMap ActionName ActionInfo -- info of all actions
 
-getPGFunctionInfo
-  :: SourceName -> QualifiedFunction -> SourceCache 'Postgres -> Maybe FunctionInfo
-getPGFunctionInfo sourceName qualifiedFunction m =
-  M.lookup sourceName m >>= M.lookup qualifiedFunction . _pcFunctions
+unsafeFunctionCache
+  :: forall b. Backend b => SourceName -> SourceCache -> Maybe (FunctionCache b)
+unsafeFunctionCache sourceName cache =
+  unsafeSourceFunctions @b =<< M.lookup sourceName cache
 
-getPGTableInfo
-  :: SourceName -> QualifiedTable -> SourceCache 'Postgres -> Maybe (TableInfo 'Postgres)
-getPGTableInfo sourceName qualifiedTable m =
-  M.lookup sourceName m >>= M.lookup qualifiedTable . _pcTables
+unsafeFunctionInfo
+  :: forall b. Backend b => SourceName -> FunctionName b -> SourceCache -> Maybe (FunctionInfo b)
+unsafeFunctionInfo sourceName functionName cache =
+  M.lookup functionName =<< unsafeFunctionCache @b sourceName cache
+
+type InheritedRolesCache = M.HashMap RoleName (HashSet RoleName)
+
+unsafeTableCache
+  :: forall b. Backend b => SourceName -> SourceCache -> Maybe (TableCache b)
+unsafeTableCache sourceName cache = do
+  unsafeSourceTables @b =<< M.lookup sourceName cache
+
+unsafeTableInfo
+  :: forall b. Backend b => SourceName -> TableName b -> SourceCache -> Maybe (TableInfo b)
+unsafeTableInfo sourceName tableName cache =
+  M.lookup tableName =<< unsafeTableCache @b sourceName cache
 
 data SchemaCache
   = SchemaCache
-  { scPostgres                    :: !(SourceCache 'Postgres)
-  , scActions                     :: !ActionCache
-  , scRemoteSchemas               :: !RemoteSchemaMap
-  , scAllowlist                   :: !(HS.HashSet GQLQuery)
-  , scGQLContext                  :: !(HashMap RoleName (RoleContext GQLContext))
-  , scUnauthenticatedGQLContext   :: !GQLContext
-  , scRelayContext                :: !(HashMap RoleName (RoleContext GQLContext))
-  , scUnauthenticatedRelayContext :: !GQLContext
-  -- , scCustomTypes       :: !(NonObjectTypeMap, AnnotatedObjects)
-  , scDepMap                      :: !DepMap
-  , scInconsistentObjs            :: ![InconsistentMetadata]
-  , scCronTriggers                :: !(M.HashMap TriggerName CronTriggerInfo)
+  { scSources                        :: !SourceCache
+  , scActions                        :: !ActionCache
+  , scRemoteSchemas                  :: !RemoteSchemaMap
+  , scAllowlist                      :: !(HS.HashSet GQLQuery)
+  , scGQLContext                     :: !(HashMap RoleName (RoleContext GQLContext))
+  , scUnauthenticatedGQLContext      :: !GQLContext
+  , scRelayContext                   :: !(HashMap RoleName (RoleContext GQLContext))
+  , scUnauthenticatedRelayContext    :: !GQLContext
+  , scDepMap                         :: !DepMap
+  , scInconsistentObjs               :: ![InconsistentMetadata]
+  , scCronTriggers                   :: !(M.HashMap TriggerName CronTriggerInfo)
+  , scEndpoints                      :: !(EndpointTrie GQLQueryWithText)
+  , scApiLimits                      :: !ApiLimit
+  , scMetricsConfig                  :: !MetricsConfig
+  , scMetadataResourceVersion        :: !(Maybe MetadataResourceVersion)
+  , scSetGraphqlIntrospectionOptions :: !SetGraphqlIntrospectionOptions
+  , scQueryTagsConfig                :: !QueryTagsConfig
   }
-$(deriveToJSON (aesonDrop 2 snakeCase) ''SchemaCache)
 
-getFuncsOfTable :: QualifiedTable -> FunctionCache -> [FunctionInfo]
-getFuncsOfTable qt fc = flip filter allFuncs $ \f -> qt == fiReturnType f
-  where
-    allFuncs = M.elems fc
+-- WARNING: this can only be used for debug purposes, as it loses all
+-- backend-specific information in the process!
+instance ToJSON SchemaCache where
+  toJSON SchemaCache{..} = object
+    [ "sources"                           .= toJSON (AB.debugAnyBackendToJSON <$> scSources)
+    , "actions"                           .= toJSON scActions
+    , "remote_schemas"                    .= toJSON scRemoteSchemas
+    , "allowlist"                         .= toJSON scAllowlist
+    , "g_q_l_context"                     .= toJSON scGQLContext
+    , "unauthenticated_g_q_l_context"     .= toJSON scUnauthenticatedGQLContext
+    , "relay_context"                     .= toJSON scRelayContext
+    , "unauthenticated_relay_context"     .= toJSON scUnauthenticatedRelayContext
+    , "dep_map"                           .= toJSON scDepMap
+    , "inconsistent_objs"                 .= toJSON scInconsistentObjs
+    , "cron_triggers"                     .= toJSON scCronTriggers
+    , "endpoints"                         .= toJSON scEndpoints
+    , "api_limits"                        .= toJSON scApiLimits
+    , "metrics_config"                    .= toJSON scMetricsConfig
+    , "metadata_resource_version"         .= toJSON scMetadataResourceVersion
+    , "set_graphql_introspection_options" .= toJSON scSetGraphqlIntrospectionOptions
+    ]
 
 getAllRemoteSchemas :: SchemaCache -> [RemoteSchemaName]
 getAllRemoteSchemas sc =
@@ -304,7 +377,7 @@ instance (SourceM m) => SourceM (TraceT m) where
 
 newtype SourceT m a
   = SourceT { runSourceT :: SourceName -> m a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadError e, MonadState s, MonadWriter w, MonadTx, TableCoreInfoRM b, CacheRM)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadError e, MonadState s, MonadWriter w, PG.MonadTx, TableCoreInfoRM b, CacheRM)
     via (ReaderT SourceName m)
   deriving (MonadTrans) via (ReaderT SourceName)
 
@@ -327,7 +400,7 @@ instance (TableCoreInfoRM b m) => TableCoreInfoRM b (TraceT m) where
 
 newtype TableCoreCacheRT b m a
   = TableCoreCacheRT { runTableCoreCacheRT :: (SourceName, Dependency (TableCoreCache b)) -> m a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadError e, MonadState s, MonadWriter w, MonadTx)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadError e, MonadState s, MonadWriter w, PG.MonadTx)
     via (ReaderT (SourceName, Dependency (TableCoreCache b)) m)
   deriving (MonadTrans) via (ReaderT (SourceName, Dependency (TableCoreCache b)))
 
@@ -358,9 +431,12 @@ instance (TableInfoRM b m) => TableInfoRM b (TraceT m) where
 
 newtype TableCacheRT b m a
   = TableCacheRT { runTableCacheRT :: (SourceName, TableCache b) -> m a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadError e, MonadState s, MonadWriter w, MonadTx)
+  deriving (Functor, Applicative, Monad, MonadIO, MonadError e, MonadState s, MonadWriter w, PG.MonadTx)
     via (ReaderT (SourceName, TableCache b) m)
   deriving (MonadTrans) via (ReaderT (SourceName, TableCache b))
+
+instance (UserInfoM m) => UserInfoM (TableCacheRT b m) where
+  askUserInfo = lift askUserInfo
 
 instance (Monad m) => SourceM (TableCacheRT b m) where
   askCurrentSource =
@@ -385,18 +461,8 @@ instance (Monoid w, CacheRM m) => CacheRM (WriterT w m) where
   askSchemaCache = lift askSchemaCache
 instance (CacheRM m) => CacheRM (TraceT m) where
   askSchemaCache = lift askSchemaCache
-instance (CacheRM m) => CacheRM (LazyTxT QErr m) where
+instance (CacheRM m) => CacheRM (PG.LazyTxT QErr m) where
   askSchemaCache = lift askSchemaCache
-
-askFunctionInfo
-  :: (CacheRM m, QErrM m)
-  => SourceName -> QualifiedFunction ->  m FunctionInfo
-askFunctionInfo sourceName qf = do
-  sc <- askSchemaCache
-  onNothing (getPGFunctionInfo sourceName qf $ scPostgres sc) throwNoFn
-  where
-    throwNoFn = throw400 NotExists $
-      "function not found in cache " <>> qf
 
 getDependentObjs :: SchemaCache -> SchemaObjId -> [SchemaObjId]
 getDependentObjs = getDependentObjsWith (const True)
@@ -404,15 +470,79 @@ getDependentObjs = getDependentObjsWith (const True)
 getDependentObjsWith
   :: (DependencyReason -> Bool) -> SchemaCache -> SchemaObjId -> [SchemaObjId]
 getDependentObjsWith f sc objId =
-  -- [ sdObjId sd | sd <- filter (f . sdReason) allDeps]
   map fst $ filter (isDependency . snd) $ M.toList $ scDepMap sc
   where
     isDependency deps = not $ HS.null $ flip HS.filter deps $
       \(SchemaDependency depId reason) -> objId `induces` depId && f reason
     -- induces a b : is b dependent on a
-    induces (SOSource s1)                   (SOSource s2)                        = s1 == s2
-    induces (SOSource s1)                   (SOSourceObj s2 _)                   = s1 == s2
-    induces (SOSourceObj s1 (SOITable tn1)) (SOSourceObj s2 (SOITable tn2))      = s1 == s2 && tn1 == tn2
-    induces (SOSourceObj s1 (SOITable tn1)) (SOSourceObj s2 (SOITableObj tn2 _)) = s1 == s2 && tn1 == tn2
-    induces objId1 objId2                                                        = objId1 == objId2
-    -- allDeps = toList $ fromMaybe HS.empty $ M.lookup objId $ scDepMap sc
+    induces (SOSource s1) (SOSource s2)                   = s1 == s2
+    induces (SOSource s1) (SOSourceObj s2 _)              = s1 == s2
+    induces o1@(SOSourceObj s1 e1) o2@(SOSourceObj s2 e2) =
+        s1 == s2 && fromMaybe (o1 == o2) (AB.composeAnyBackend @Backend go e1 e2 Nothing)
+    induces o1 o2                                         = o1 == o2
+
+    go (SOITable tn1) (SOITable tn2)      = Just $ tn1 == tn2
+    go (SOITable tn1) (SOITableObj tn2 _) = Just $ tn1 == tn2
+    go _              _                   = Nothing
+
+
+-- | Build dependencies from an AnnBoolExpPartialSQL.
+getBoolExpDeps
+  :: forall b. Backend b
+  => SourceName
+  -> TableName b
+  -> AnnBoolExpPartialSQL b
+  -> [SchemaDependency]
+getBoolExpDeps source tn = \case
+  BoolAnd exps -> procExps exps
+  BoolOr  exps -> procExps exps
+  BoolNot e    -> getBoolExpDeps source tn e
+  BoolFld fld  -> getColExpDeps  source tn fld
+  BoolExists (GExists refqt whereExp) ->
+    let tableDep = SchemaDependency
+                     (SOSourceObj source
+                       $ AB.mkAnyBackend
+                       $ SOITable @b refqt)
+                     DRRemoteTable
+    in tableDep : getBoolExpDeps source refqt whereExp
+  where
+    procExps = concatMap (getBoolExpDeps source tn)
+
+getColExpDeps
+  :: forall b. Backend b
+  => SourceName
+  -> TableName b
+  -> AnnBoolExpFld b (PartialSQLExp b)
+  -> [SchemaDependency]
+getColExpDeps source tableName = \case
+  AVColumn colInfo opExps ->
+    let columnName = pgiColumn colInfo
+        colDepReason = bool DRSessionVariable DROnType $ any hasStaticExp opExps
+        colDep = mkColDep @b colDepReason source tableName columnName
+        colDepsInOpExp = mkOpExpDeps opExps
+    in colDep:colDepsInOpExp
+  AVRelationship relInfo relBoolExp ->
+    let relationshipName = riName relInfo
+        relationshipTable = riRTable relInfo
+        schemaDependency =
+          SchemaDependency
+            (SOSourceObj source
+              $ AB.mkAnyBackend
+              $ SOITableObj @b tableName (TORel relationshipName))
+            DROnType
+    in schemaDependency : getBoolExpDeps source relationshipTable relBoolExp
+
+  AVComputedField computedFieldBoolExp ->
+    let mkComputedFieldDep' r =
+          mkComputedFieldDep @b r source tableName $ _acfbName computedFieldBoolExp
+    in case _acfbBoolExp computedFieldBoolExp of
+      CFBEScalar opExps ->
+        let computedFieldDep = mkComputedFieldDep' $
+                               bool DRSessionVariable DROnType $ any hasStaticExp opExps
+        in computedFieldDep : mkOpExpDeps opExps
+      CFBETable cfTable cfTableBoolExp ->
+        mkComputedFieldDep' DROnType : getBoolExpDeps source cfTable cfTableBoolExp
+  where
+    mkOpExpDeps opExps = do
+      (col, rootTable) <- mapMaybe opExpDepCol opExps
+      pure $ mkColDep @b DROnType source (fromMaybe tableName rootTable) col

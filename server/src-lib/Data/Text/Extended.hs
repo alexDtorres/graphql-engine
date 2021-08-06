@@ -15,8 +15,9 @@ module Data.Text.Extended
 
 import           Hasura.Prelude
 
-import qualified Language.GraphQL.Draft.Syntax  as G
+import qualified Database.ODBC.SQLServer        as ODBC
 import qualified Language.GraphQL.Draft.Printer as G
+import qualified Language.GraphQL.Draft.Syntax  as G
 import qualified Text.Builder                   as TB
 
 import           Data.Text                      as DT
@@ -29,13 +30,26 @@ instance ToTxt Text where
   toTxt = id
   {-# INLINE toTxt #-}
 
+instance ToTxt Char where
+  toTxt = DT.singleton
+
 instance ToTxt G.Name where
   toTxt = G.unName
 
 deriving instance ToTxt G.EnumValue
 
+instance ToTxt () where
+  toTxt = tshow
+
+instance ToTxt Void where
+  toTxt = absurd
+
 instance ToTxt (G.Value Void) where
   toTxt = TB.run . G.value
+
+instance ToTxt ODBC.Query where
+  toTxt = ODBC.renderQuery
+
 
 bquote :: ToTxt t => t -> Text
 bquote t = DT.singleton '`' <> toTxt t <> DT.singleton '`'

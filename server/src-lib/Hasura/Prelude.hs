@@ -17,6 +17,7 @@ module Hasura.Prelude
   , spanMaybeM
   , liftEitherM
   , hoistMaybe
+  , hoistEither
   , tshow
   -- * Efficient coercions
   , coerce
@@ -28,77 +29,79 @@ module Hasura.Prelude
   -- * Measuring and working with moments and durations
   , withElapsedTime
   , startTimer
+  -- * Aeson options
+  , hasuraJSON
   , module Data.Time.Clock.Units
   ) where
 
-import           Control.Applicative               as M (Alternative (..), liftA2)
-import           Control.Arrow                     as M (first, second, (&&&), (***), (<<<), (>>>))
-import           Control.DeepSeq                   as M (NFData, deepseq, force)
-import           Control.Lens                      as M (ix, (%~))
-import           Control.Monad.Base                as M
-import           Control.Monad.Except              as M
-import           Control.Monad.Identity            as M
-import           Control.Monad.Reader              as M
-import           Control.Monad.State.Strict        as M
-import           Control.Monad.Trans.Maybe         as M (MaybeT (..))
-import           Control.Monad.Writer.Strict       as M (MonadWriter (..), WriterT (..),
-                                                         execWriterT, runWriterT)
-import           Data.Align                        as M (Semialign (align, alignWith))
-import           Data.Bool                         as M (bool)
-import           Data.Data                         as M (Data (..))
-import           Data.Either                       as M (lefts, partitionEithers, rights)
-import           Data.Foldable                     as M (asum, fold, foldrM, for_, toList,
-                                                         traverse_)
-import           Data.Function                     as M (on, (&))
-import           Data.Functor                      as M (($>), (<&>))
-import           Data.Hashable                     as M (Hashable)
-import           Data.HashMap.Strict               as M (HashMap)
-import           Data.HashMap.Strict.InsOrd        as M (InsOrdHashMap)
-import           Data.HashSet                      as M (HashSet)
-import           Data.List                         as M (find, findIndex, foldl', group,
-                                                         intercalate, intersect, lookup, sort,
-                                                         sortBy, sortOn, union, unionBy, (\\))
-import           Data.List.NonEmpty                as M (NonEmpty (..), nonEmpty)
-import           Data.Maybe                        as M (catMaybes, fromMaybe, isJust, isNothing,
-                                                         listToMaybe, mapMaybe, maybeToList)
-import           Data.Monoid                       as M (getAlt)
-import           Data.Ord                          as M (comparing)
-import           Data.Semigroup                    as M (Semigroup (..))
-import           Data.Sequence                     as M (Seq)
-import           Data.Sequence.NonEmpty            as M (NESeq)
-import           Data.String                       as M (IsString)
-import           Data.Text                         as M (Text)
-import           Data.These                        as M (These (..), fromThese, mergeThese,
-                                                         mergeTheseWith, partitionThese, these)
-import           Data.Time.Clock.Units
-import           Data.Traversable                  as M (for)
-import           Data.Void                         as M (Void, absurd)
-import           Data.Word                         as M (Word64)
-import           GHC.Generics                      as M (Generic)
-import           Prelude                           as M hiding (fail, init, lookup)
-import           Test.QuickCheck.Arbitrary.Generic as M
-import           Text.Read                         as M (readEither, readMaybe)
-
-import qualified Data.ByteString                   as B
-import qualified Data.ByteString.Base64.Lazy       as Base64
-import qualified Data.ByteString.Lazy              as BL
+import           Control.Applicative         as M (Alternative (..), liftA2)
+import           Control.Arrow               as M (first, second, (&&&), (***), (<<<), (>>>))
+import           Control.DeepSeq             as M (NFData, deepseq, force)
+import           Control.Lens                as M (ix, (%~))
+import           Control.Monad.Base          as M
+import           Control.Monad.Except        as M
+import           Control.Monad.Identity      as M
+import           Control.Monad.Reader        as M
+import           Control.Monad.State.Strict  as M
+import           Control.Monad.Trans.Maybe   as M (MaybeT (..))
+import           Control.Monad.Writer.Strict as M (MonadWriter (..), WriterT (..), execWriterT,
+                                                   runWriterT)
+import           Data.Align                  as M (Semialign (align, alignWith))
+import           Data.Bool                   as M (bool)
 import           Data.Coerce
-import qualified Data.HashMap.Strict               as Map
-import qualified Data.HashMap.Strict.InsOrd        as OMap
-import qualified Data.Text                         as T
-import qualified Data.Text.Encoding                as TE
-import qualified Data.Text.Encoding.Error          as TE
-import qualified GHC.Clock                         as Clock
-import qualified Test.QuickCheck                   as QC
+import           Data.Data                   as M (Data (..))
+import           Data.Either                 as M (lefts, partitionEithers, rights)
+import           Data.Foldable               as M (asum, fold, foldlM, foldrM, for_, toList,
+                                                   traverse_)
+import           Data.Function               as M (on, (&))
+import           Data.Functor                as M (($>), (<&>))
+import           Data.Functor.Const          as M (Const)
+import           Data.HashMap.Strict         as M (HashMap)
+import           Data.HashMap.Strict.InsOrd  as M (InsOrdHashMap)
+import           Data.HashSet                as M (HashSet)
+import           Data.Hashable               as M (Hashable)
+import           Data.List                   as M (find, findIndex, foldl', group, intercalate,
+                                                   intersect, lookup, sort, sortBy, sortOn, union,
+                                                   unionBy, (\\))
+import           Data.List.NonEmpty          as M (NonEmpty (..), nonEmpty)
+import           Data.Maybe                  as M (catMaybes, fromMaybe, isJust, isNothing,
+                                                   listToMaybe, mapMaybe, maybeToList)
+import           Data.Monoid                 as M (getAlt)
+import           Data.Ord                    as M (comparing)
+import           Data.Semigroup              as M (Semigroup (..))
+import           Data.Sequence               as M (Seq)
+import           Data.Sequence.NonEmpty      as M (NESeq)
+import           Data.String                 as M (IsString)
+import           Data.Text                   as M (Text)
+import           Data.These                  as M (These (..), fromThese, mergeThese,
+                                                   mergeTheseWith, partitionThese, these)
+import           Data.Time.Clock.Units
+import           Data.Traversable            as M (for)
+import           Data.Void                   as M (Void, absurd)
+import           Data.Word                   as M (Word64)
+import           GHC.Generics                as M (Generic)
+import           Prelude                     as M hiding (fail, init, lookup)
+import           Text.Read                   as M (readEither, readMaybe)
+
+import qualified Data.Aeson                  as J
+import qualified Data.Aeson.Casing           as J
+import qualified Data.ByteString             as B
+import qualified Data.ByteString.Base64.Lazy as Base64
+import qualified Data.ByteString.Lazy        as BL
+import qualified Data.HashMap.Strict         as Map
+import qualified Data.HashMap.Strict.InsOrd  as OMap
+import qualified Data.Hashable               as H
+import qualified Data.Text                   as T
+import qualified Data.Text.Encoding          as TE
+import qualified Data.Text.Encoding.Error    as TE
+import qualified GHC.Clock                   as Clock
+
 
 alphabet :: String
 alphabet = ['a'..'z'] ++ ['A'..'Z']
 
 alphaNumerics :: String
 alphaNumerics = alphabet ++ "0123456789"
-
-instance Arbitrary Text where
-  arbitrary = T.pack <$> QC.listOf (QC.elements alphaNumerics)
 
 onNothing :: Applicative m => Maybe a -> m a -> m a
 onNothing m act = maybe act pure m
@@ -196,8 +199,17 @@ startTimer = do
     return $ nanoseconds $ fromIntegral (aft - bef)
 
 -- copied from http://hackage.haskell.org/package/errors-2.3.0/docs/src/Control.Error.Util.html#hoistMaybe
-hoistMaybe :: (Monad m) => Maybe b -> MaybeT m b
-hoistMaybe = MaybeT . return
+hoistMaybe :: Applicative m => Maybe b -> MaybeT m b
+hoistMaybe = MaybeT . pure
+
+hoistEither :: Applicative m => Either e a -> ExceptT e m a
+hoistEither = ExceptT . pure
 
 tshow :: Show a => a -> Text
 tshow = T.pack . show
+
+hasuraJSON :: J.Options
+hasuraJSON = J.aesonPrefix J.snakeCase
+
+instance (Hashable a) => Hashable (Seq a) where
+  hashWithSalt i = H.hashWithSalt i . toList

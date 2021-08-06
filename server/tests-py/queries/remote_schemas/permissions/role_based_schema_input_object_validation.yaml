@@ -2,7 +2,7 @@ description:
   The types of the fields of the input 'IntCompareObj'
   object in the upstream remote schema is 'Int', so a different
   type should throw an error
-url: /v1/query
+url: /v1/metadata
 status: 400
 query:
   type: add_remote_schema_permissions
@@ -31,7 +31,7 @@ response:
   path: $.args
   error:
     "validation for the given role-based schema failed for the following reasons:\n\
-    \ • expected type of \"eq\"(\"Input object argument\") to be Int but recieved\
+    \ • expected type of \"eq\"(\"Input object argument\") to be Int but received\
     \ Boolean\n • expected type of \"gt\"(\"Input object argument\") to be Int but\
-    \ recieved Boolean\n"
+    \ received Boolean\n"
   code: validation-failed

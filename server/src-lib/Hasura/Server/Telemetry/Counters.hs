@@ -1,5 +1,5 @@
 {-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE RecordWildCards       #-}
+
 {-|
   Counters used in telemetry collection. Additional counters can be added here.and
   serviced in "Hasura.Server.Telemetry".
@@ -12,7 +12,7 @@ module Hasura.Server.Telemetry.Counters
     recordTimingMetric
   , RequestDimensions(..), RequestTimings(..)
   -- *** Dimensions
-  , CacheHit(..), QueryType(..), Locality(..), Transport(..)
+  , QueryType(..), Locality(..), Transport(..)
   -- ** Metric upload
   , dumpServiceTimingMetrics
   , ServiceTimingMetrics(..)
@@ -22,22 +22,22 @@ module Hasura.Server.Telemetry.Counters
   )
   where
 
+import           Hasura.Prelude
+
 import qualified Data.Aeson            as A
-import qualified Data.Aeson.Casing     as A
 import qualified Data.Aeson.TH         as A
-import           Data.Hashable
 import qualified Data.HashMap.Strict   as HM
+
 import           Data.IORef
 import           Data.Time.Clock.POSIX (POSIXTime, getPOSIXTime)
 import           GHC.IO.Unsafe         (unsafePerformIO)
-import           Hasura.Prelude
+
 
 -- | The properties that characterize this request. The dimensions over which
 -- we collect metrics for each serviced request.
 data RequestDimensions =
-  RequestDimensions {
-        telemCacheHit  :: !CacheHit
-      , telemQueryType :: !QueryType
+  RequestDimensions
+      { telemQueryType :: !QueryType
       , telemLocality  :: !Locality
       , telemTransport :: !Transport
       }
@@ -94,13 +94,6 @@ requestCounters = unsafePerformIO $ newIORef HM.empty
 approxStartTime :: POSIXTime
 {-# NOINLINE approxStartTime #-}
 approxStartTime = unsafePerformIO getPOSIXTime
-
--- | Did this request hit the plan cache?
-data CacheHit = Hit | Miss
-  deriving (Enum, Show, Eq, Generic)
-instance Hashable CacheHit
-instance A.ToJSON CacheHit
-instance A.FromJSON CacheHit
 
 -- | Was this request a mutation (involved DB writes)?
 data QueryType = Mutation | Query
@@ -176,8 +169,8 @@ data ServiceTimingMetric
   deriving (Show, Generic, Eq)
 
 
-$(A.deriveJSON (A.aesonDrop 5 A.snakeCase) ''RequestTimingsCount)
-$(A.deriveJSON (A.aesonDrop 5 A.snakeCase) ''RequestDimensions)
+$(A.deriveJSON hasuraJSON ''RequestTimingsCount)
+$(A.deriveJSON hasuraJSON ''RequestDimensions)
 
 instance A.ToJSON ServiceTimingMetric
 instance A.FromJSON ServiceTimingMetric

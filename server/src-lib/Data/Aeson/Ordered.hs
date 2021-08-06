@@ -1,5 +1,4 @@
-{-# LANGUAGE CPP                #-}
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE CPP #-}
 
 -- | A version of aeson that parses with key order preserved.
 --
@@ -21,6 +20,7 @@ module Data.Aeson.Ordered
   , array
   , insert
   , delete
+  , adjust
   , empty
   , eitherDecode
   , toEncJSON
@@ -127,6 +127,9 @@ lookup key (Object_ omap) = OMap.lookup key omap
 -- | Delete a key.
 delete :: Text -> Object -> Object
 delete key (Object_ omap) = Object_ (OMap.delete key omap)
+
+adjust :: (Value -> Value) -> Text -> Object -> Object
+adjust f key (Object_ omap) = Object_ (OMap.adjust f key omap)
 
 -- | ToList a key.
 toList :: Object -> [(Text,Value)]

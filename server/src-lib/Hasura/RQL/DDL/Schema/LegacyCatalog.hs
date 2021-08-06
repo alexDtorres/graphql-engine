@@ -15,14 +15,18 @@ import qualified Database.PG.Query                   as Q
 
 import           Control.Lens                        hiding ((.=))
 import           Data.Aeson
+import           Data.FileEmbed                      (makeRelativeToProject)
 import           Data.Text.NonEmpty
 
 import           Hasura.Backends.Postgres.Connection
 import           Hasura.Backends.Postgres.SQL.Types
+import           Hasura.Base.Error
 import           Hasura.Eventing.ScheduledTrigger
+import           Hasura.RQL.DDL.Action
 import           Hasura.RQL.DDL.ComputedField
 import           Hasura.RQL.DDL.Permission
 import           Hasura.RQL.Types
+
 
 saveMetadataToHdbTables
   :: (MonadTx m, HasSystemDefined m) => MetadataNoSources -> m ()
@@ -53,9 +57,8 @@ saveMetadataToHdbTables (MetadataNoSources tables functions schemas collections
       withPathK "remote_relationships" $
         indexedForM_ _tmRemoteRelationships $
           \(RemoteRelationshipMetadata name def) -> do
-             let RemoteRelationshipDef rs hf rf = def
-             addRemoteRelationshipToCatalog $
-               RemoteRelationship name defaultSource _tmTable hf rs rf
+                addRemoteRelationshipToCatalog $
+                  RemoteRelationship name defaultSource _tmTable def
 
       -- Permissions
       withPathK "insert_permissions" $ processPerms _tmTable _tmInsertPermissions
@@ -69,7 +72,7 @@ saveMetadataToHdbTables (MetadataNoSources tables functions schemas collections
 
   -- sql functions
   withPathK "functions" $ indexedForM_ functions $
-    \(FunctionMetadata function config) -> addFunctionToCatalog function config
+    \(FunctionMetadata function config _) -> addFunctionToCatalog function config
 
   -- query collections
   systemDefined <- askSystemDefined
@@ -107,12 +110,12 @@ saveMetadataToHdbTables (MetadataNoSources tables functions schemas collections
 
   where
     processPerms tableName perms = indexedForM_ perms $ \perm -> do
-      let pt = permAccToType $ getPermAcc1 perm
+      let pt = permAccToType @('Postgres 'Vanilla) $ getPermAcc1 perm
       systemDefined <- askSystemDefined
       liftTx $ addPermissionToCatalog pt tableName perm systemDefined
 
 saveTableToCatalog
-  :: (MonadTx m, HasSystemDefined m) => QualifiedTable -> Bool -> TableConfig -> m ()
+  :: (MonadTx m, HasSystemDefined m) => QualifiedTable -> Bool -> TableConfig ('Postgres 'Vanilla) -> m ()
 saveTableToCatalog (QualifiedObject sn tn) isEnum config = do
   systemDefined <- askSystemDefined
   liftTx $ Q.unitQE defaultTxErrorHandler [Q.sql|
@@ -158,7 +161,7 @@ addEventTriggerToCatalog qt etc = liftTx do
 
 addComputedFieldToCatalog
   :: MonadTx m
-  => AddComputedField -> m ()
+  => AddComputedField ('Postgres 'Vanilla) -> m ()
 addComputedFieldToCatalog q =
   liftTx $ Q.withQE defaultTxErrorHandler
     [Q.sql|
@@ -170,18 +173,16 @@ addComputedFieldToCatalog q =
     QualifiedObject schemaName tableName = table
     AddComputedField _ table computedField definition comment = q
 
-addRemoteRelationshipToCatalog :: MonadTx m => RemoteRelationship -> m ()
+addRemoteRelationshipToCatalog :: MonadTx m => RemoteRelationship ('Postgres 'Vanilla) -> m ()
 addRemoteRelationshipToCatalog remoteRelationship = liftTx $
   Q.unitQE defaultTxErrorHandler [Q.sql|
        INSERT INTO hdb_catalog.hdb_remote_relationship
        (remote_relationship_name, table_schema, table_name, definition)
        VALUES ($1, $2, $3, $4::jsonb)
-  |] (rtrName remoteRelationship, schemaName, tableName, Q.AltJ definition) True
+  |] (_rtrName remoteRelationship, schemaName, tableName, Q.AltJ definition) True
   where
-    QualifiedObject schemaName tableName = rtrTable remoteRelationship
-    definition = mkRemoteRelationshipDef remoteRelationship
-    mkRemoteRelationshipDef RemoteRelationship {..} =
-      RemoteRelationshipDef rtrRemoteSchema rtrHasuraFields rtrRemoteField
+    QualifiedObject schemaName tableName = _rtrTable remoteRelationship
+    definition = _rtrDefinition remoteRelationship
 
 addFunctionToCatalog
   :: (MonadTx m, HasSystemDefined m)
@@ -340,9 +341,9 @@ fetchMetadataFromHdbTables = liftTx do
 
   -- fetch actions
   actions <- oMapFromL _amName <$> fetchActions
+  cronTriggers <- fetchCronTriggers
 
-  MetadataNoSources fullTableMetaMap functions remoteSchemas collections
-           allowlist customTypes actions <$> fetchCronTriggers
+  pure $ MetadataNoSources fullTableMetaMap functions remoteSchemas collections allowlist customTypes actions cronTriggers
 
   where
     modMetaMap l f xs = do
@@ -407,7 +408,10 @@ fetchMetadataFromHdbTables = liftTx do
                     |] () False
       pure $ oMapFromL _fmFunction $
         flip map l $ \(sn, fn, Q.AltJ config) ->
-                       FunctionMetadata (QualifiedObject sn fn) config
+                       -- function permissions were only introduced post 43rd
+                       -- migration, so it's impossible we get any permissions
+                       -- here
+                       FunctionMetadata (QualifiedObject sn fn) config []
 
     fetchRemoteSchemas =
       map fromRow <$> Q.listQE defaultTxErrorHandler
@@ -451,7 +455,7 @@ fetchMetadataFromHdbTables = liftTx do
                           )
 
     fetchCronTriggers =
-      (oMapFromL ctName . map uncurryCronTrigger)
+      oMapFromL ctName . map uncurryCronTrigger
               <$> Q.listQE defaultTxErrorHandler
       [Q.sql|
        SELECT ct.name, ct.webhook_conf, ct.cron_schedule, ct.payload,
@@ -554,14 +558,14 @@ fetchMetadataFromHdbTables = liftTx do
 -- instead.
 recreateSystemMetadata :: (MonadTx m) => m ()
 recreateSystemMetadata = do
-  () <- liftTx $ Q.multiQE defaultTxErrorHandler $(Q.sqlFromFile "src-rsr/clear_system_metadata.sql")
+  () <- liftTx $ Q.multiQE defaultTxErrorHandler $(makeRelativeToProject "src-rsr/clear_system_metadata.sql" >>= Q.sqlFromFile)
   runHasSystemDefinedT (SystemDefined True) $ for_ systemMetadata \(tableName, tableRels) -> do
     saveTableToCatalog tableName False emptyTableConfig
     for_ tableRels \case
       Left relDef  -> insertRelationshipToCatalog tableName ObjRel relDef
       Right relDef -> insertRelationshipToCatalog tableName ArrRel relDef
   where
-    systemMetadata :: [(QualifiedTable, [Either ObjRelDef ArrRelDef])]
+    systemMetadata :: [(QualifiedTable, [Either (ObjRelDef ('Postgres 'Vanilla)) (ArrRelDef ('Postgres 'Vanilla))])]
     systemMetadata =
       [ table "information_schema" "tables" []
       , table "information_schema" "schemata" []
@@ -602,9 +606,9 @@ recreateSystemMetadata = do
         [ objectRel $$(nonEmptyText "trigger") $
           manualConfig "hdb_catalog" "event_triggers" [("trigger_name", "name")]
         , arrayRel $$(nonEmptyText "logs") $ RUFKeyOn $
-          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "event_invocation_logs") "event_id" ]
+          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "event_invocation_logs") (pure "event_id") ]
       , table "hdb_catalog" "event_invocation_logs"
-        [ objectRel $$(nonEmptyText "event") $ RUFKeyOn "event_id" ]
+        [ objectRel $$(nonEmptyText "event") $ RUFKeyOn $ SameTable (pure "event_id") ]
       , table "hdb_catalog" "hdb_function" []
       , table "hdb_catalog" "hdb_function_agg"
         [ objectRel $$(nonEmptyText "return_table_info") $ manualConfig "hdb_catalog" "hdb_table"
@@ -629,22 +633,22 @@ recreateSystemMetadata = do
         ]
       , table "hdb_catalog" "hdb_cron_triggers"
         [ arrayRel $$(nonEmptyText "cron_events") $ RUFKeyOn $
-          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "hdb_cron_events") "trigger_name"
+          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "hdb_cron_events") (pure "trigger_name")
         ]
       , table "hdb_catalog" "hdb_cron_events"
-        [ objectRel $$(nonEmptyText "cron_trigger") $ RUFKeyOn "trigger_name"
+        [ objectRel $$(nonEmptyText "cron_trigger") $ RUFKeyOn $ SameTable (pure "trigger_name")
         , arrayRel $$(nonEmptyText "cron_event_logs") $ RUFKeyOn $
-          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "hdb_cron_event_invocation_logs") "event_id"
+          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "hdb_cron_event_invocation_logs") (pure "event_id")
         ]
       , table "hdb_catalog" "hdb_cron_event_invocation_logs"
-        [ objectRel $$(nonEmptyText "cron_event") $ RUFKeyOn "event_id"
+        [ objectRel $$(nonEmptyText "cron_event") $ RUFKeyOn $ SameTable (pure "event_id")
         ]
       , table "hdb_catalog" "hdb_scheduled_events"
         [ arrayRel $$(nonEmptyText "scheduled_event_logs") $ RUFKeyOn $
-          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "hdb_scheduled_event_invocation_logs") "event_id"
+          ArrRelUsingFKeyOn (QualifiedObject "hdb_catalog" "hdb_scheduled_event_invocation_logs") (pure "event_id")
         ]
       , table "hdb_catalog" "hdb_scheduled_event_invocation_logs"
-        [ objectRel $$(nonEmptyText "scheduled_event")  $ RUFKeyOn "event_id"
+        [ objectRel $$(nonEmptyText "scheduled_event") $ RUFKeyOn $ SameTable (pure "event_id")
         ]
       ]
 
@@ -656,4 +660,4 @@ recreateSystemMetadata = do
     objectRel name using = Left $ RelDef (RelName name) using Nothing
     arrayRel name using = Right $ RelDef (RelName name) using Nothing
     manualConfig schemaName tableName columns =
-      RUManual $ RelManualConfig (QualifiedObject schemaName tableName) (HM.fromList columns)
+      RUManual $ RelManualConfig (QualifiedObject schemaName tableName) (HM.fromList columns) Nothing

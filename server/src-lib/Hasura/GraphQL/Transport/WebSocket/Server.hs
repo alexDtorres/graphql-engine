@@ -1,6 +1,5 @@
+{-# LANGUAGE CPP                      #-}
 {-# LANGUAGE NondecreasingIndentation #-}
-{-# LANGUAGE RankNTypes               #-}
-{-# LANGUAGE CPP #-}
 
 module Hasura.GraphQL.Transport.WebSocket.Server
   ( WSId(..)
@@ -74,7 +73,7 @@ data MessageDetails
   { _mdMessage     :: !TBS.TByteString
   , _mdMessageSize :: !Int64
   } deriving (Show, Eq)
-$(J.deriveToJSON (J.aesonDrop 3 J.snakeCase) ''MessageDetails)
+$(J.deriveToJSON hasuraJSON ''MessageDetails)
 
 data WSEvent
   = EConnectionRequest

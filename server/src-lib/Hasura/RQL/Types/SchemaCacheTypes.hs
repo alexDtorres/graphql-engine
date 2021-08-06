@@ -5,75 +5,83 @@ import           Hasura.Prelude
 import qualified Data.Text                           as T
 
 import           Data.Aeson
-import           Data.Aeson.Casing
 import           Data.Aeson.TH
 import           Data.Aeson.Types
 import           Data.Text.Extended
 import           Data.Text.NonEmpty
 
-import           Hasura.Backends.Postgres.SQL.Types
-import           Hasura.RQL.Types.Common             hiding (ConstraintName)
+import qualified Hasura.SQL.AnyBackend               as AB
+
+import           Hasura.RQL.Types.Backend
+import           Hasura.RQL.Types.Common
 import           Hasura.RQL.Types.ComputedField
 import           Hasura.RQL.Types.EventTrigger
+import           Hasura.RQL.Types.Instances          ()
 import           Hasura.RQL.Types.Permission
 import           Hasura.RQL.Types.RemoteRelationship
 import           Hasura.RQL.Types.RemoteSchema
+import           Hasura.SQL.Backend
 import           Hasura.Session
 
-data TableObjId
-  = TOCol !PGCol
+
+data TableObjId (b :: BackendType)
+  = TOCol !(Column b)
   | TORel !RelName
   | TOComputedField !ComputedFieldName
   | TORemoteRel !RemoteRelationshipName
-  | TOForeignKey !ConstraintName
+  | TOForeignKey !(ConstraintName b)
   | TOPerm !RoleName !PermType
   | TOTrigger !TriggerName
-  deriving (Show, Eq, Generic)
-instance Hashable TableObjId
+  deriving (Generic)
+deriving instance Backend b => Eq (TableObjId b)
+instance (Backend b) => Hashable (TableObjId b)
 
-data SourceObjId
-  = SOITable !QualifiedTable
-  | SOITableObj !QualifiedTable !TableObjId
-  | SOIFunction !QualifiedFunction
-  deriving (Show, Eq, Generic)
-instance Hashable SourceObjId
+data SourceObjId (b :: BackendType)
+  = SOITable !(TableName b)
+  | SOITableObj !(TableName b) !(TableObjId b)
+  | SOIFunction !(FunctionName b)
+  deriving (Eq, Generic)
+instance (Backend b) => Hashable (SourceObjId b)
 
 data SchemaObjId
   = SOSource !SourceName
-  | SOSourceObj !SourceName !SourceObjId
+  | SOSourceObj !SourceName !(AB.AnyBackend SourceObjId)
   | SORemoteSchema !RemoteSchemaName
   | SORemoteSchemaPermission !RemoteSchemaName !RoleName
+  | SORole !RoleName
   deriving (Eq, Generic)
-
 instance Hashable SchemaObjId
+
 
 reportSchemaObj :: SchemaObjId -> T.Text
 reportSchemaObj = \case
   SOSource source -> "source " <> sourceNameToText source
-  SOSourceObj source sourceObjId -> inSource source $
-    case sourceObjId of
-      SOITable tn -> "table " <> qualifiedObjectToText tn
-      SOIFunction fn -> "function " <> qualifiedObjectToText fn
-      SOITableObj tn (TOCol cn) ->
-        "column " <> qualifiedObjectToText tn <> "." <> getPGColTxt cn
-      SOITableObj tn (TORel cn) ->
-        "relationship " <> qualifiedObjectToText tn <> "." <> relNameToTxt cn
-      SOITableObj tn (TOForeignKey cn) ->
-        "constraint " <> qualifiedObjectToText tn <> "." <> getConstraintTxt cn
-      SOITableObj tn (TOPerm rn pt) ->
-        "permission " <> qualifiedObjectToText tn <> "." <> roleNameToTxt rn <> "." <> permTypeToCode pt
-      SOITableObj tn (TOTrigger trn ) ->
-        "event-trigger " <> qualifiedObjectToText tn <> "." <> triggerNameToTxt trn
-      SOITableObj tn (TOComputedField ccn) ->
-        "computed field " <> qualifiedObjectToText tn <> "." <> computedFieldNameToText ccn
-      SOITableObj tn (TORemoteRel rn) ->
-        "remote relationship " <> qualifiedObjectToText tn <> "." <> remoteRelationshipNameToText rn
+  SOSourceObj source exists -> inSource source $
+    AB.dispatchAnyBackend @Backend exists
+      \case
+        SOITable tn -> "table " <> toTxt tn
+        SOIFunction fn -> "function " <> toTxt fn
+        SOITableObj tn (TOCol cn) ->
+          "column " <> toTxt tn <> "." <> toTxt cn
+        SOITableObj tn (TORel cn) ->
+          "relationship " <> toTxt tn <> "." <> toTxt cn
+        SOITableObj tn (TOForeignKey cn) ->
+          "constraint " <> toTxt tn <> "." <> toTxt cn
+        SOITableObj tn (TOPerm rn pt) ->
+          "permission " <> toTxt tn <> "." <> roleNameToTxt rn <> "." <> permTypeToCode pt
+        SOITableObj tn (TOTrigger trn ) ->
+          "event-trigger " <> toTxt tn <> "." <> triggerNameToTxt trn
+        SOITableObj tn (TOComputedField ccn) ->
+          "computed field " <> toTxt tn <> "." <> computedFieldNameToText ccn
+        SOITableObj tn (TORemoteRel rn) ->
+          "remote relationship " <> toTxt tn <> "." <> remoteRelationshipNameToText rn
   SORemoteSchema remoteSchemaName ->
     "remote schema " <> unNonEmptyText (unRemoteSchemaName remoteSchemaName)
   SORemoteSchemaPermission remoteSchemaName roleName ->
     "remote schema permission "
     <> unNonEmptyText (unRemoteSchemaName remoteSchemaName)
     <> "." <>> roleName
+  SORole roleName -> "role " <> roleNameToTxt roleName
   where
     inSource s t = t <> " in source " <>> s
 
@@ -102,6 +110,7 @@ data DependencyReason
   | DRParent
   | DRRemoteSchema
   | DRRemoteRelationship
+  | DRParentRole
   deriving (Show, Eq, Generic)
 
 instance Hashable DependencyReason
@@ -123,6 +132,7 @@ reasonToTxt = \case
   DRParent             -> "parent"
   DRRemoteSchema       -> "remote_schema"
   DRRemoteRelationship -> "remote_relationship"
+  DRParentRole         -> "parent_role"
 
 instance ToJSON DependencyReason where
   toJSON = String . reasonToTxt
@@ -133,5 +143,5 @@ data SchemaDependency
   , sdReason :: !DependencyReason
   } deriving (Show, Eq, Generic)
 
-$(deriveToJSON (aesonDrop 2 snakeCase) ''SchemaDependency)
+$(deriveToJSON hasuraJSON ''SchemaDependency)
 instance Hashable SchemaDependency

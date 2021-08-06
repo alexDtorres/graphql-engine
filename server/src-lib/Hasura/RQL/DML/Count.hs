@@ -20,6 +20,7 @@ import qualified Hasura.Tracing                             as Tracing
 
 import           Hasura.Backends.Postgres.SQL.Types
 import           Hasura.Backends.Postgres.Translate.BoolExp
+import           Hasura.Base.Error
 import           Hasura.EncJSON
 import           Hasura.RQL.DML.Internal
 import           Hasura.RQL.DML.Types
@@ -27,12 +28,13 @@ import           Hasura.RQL.IR.BoolExp
 import           Hasura.RQL.Types
 import           Hasura.RQL.Types.Run
 import           Hasura.SQL.Types
+import           Hasura.Session
 
 
 data CountQueryP1
   = CountQueryP1
   { cqp1Table    :: !QualifiedTable
-  , cqp1Where    :: !(AnnBoolExpSQL 'Postgres, Maybe (AnnBoolExpSQL 'Postgres))
+  , cqp1Where    :: !(AnnBoolExpSQL ('Postgres 'Vanilla), Maybe (AnnBoolExpSQL ('Postgres 'Vanilla)))
   , cqp1Distinct :: !(Maybe [PGCol])
   } deriving (Eq)
 
@@ -68,12 +70,12 @@ mkSQLCount (CountQueryP1 tn (permFltr, mWc) mDistCols) =
 -- SELECT count(*) FROM (SELECT DISTINCT c1, .. cn FROM .. WHERE ..) r;
 -- SELECT count(*) FROM (SELECT * FROM .. WHERE ..) r;
 validateCountQWith
-  :: (UserInfoM m, QErrM m, TableInfoRM 'Postgres m)
-  => SessVarBldr 'Postgres m
-  -> (ColumnType 'Postgres -> Value -> m S.SQLExp)
+  :: (UserInfoM m, QErrM m, TableInfoRM ('Postgres 'Vanilla) m)
+  => SessionVariableBuilder ('Postgres 'Vanilla) m
+  -> (ColumnType ('Postgres 'Vanilla) -> Value -> m S.SQLExp)
   -> CountQuery
   -> m CountQueryP1
-validateCountQWith sessVarBldr prepValBldr (CountQuery qt mDistCols mWhere) = do
+validateCountQWith sessVarBldr prepValBldr (CountQuery qt _ mDistCols mWhere) = do
   tableInfo <- askTabInfoSource qt
 
   -- Check if select is allowed
@@ -90,7 +92,7 @@ validateCountQWith sessVarBldr prepValBldr (CountQuery qt mDistCols mWhere) = do
   -- convert the where clause
   annSQLBoolExp <- forM mWhere $ \be ->
     withPathK "where" $
-    convBoolExp colInfoMap selPerm be sessVarBldr prepValBldr
+    convBoolExp colInfoMap selPerm be sessVarBldr qt (valueParserWithCollectableType prepValBldr)
 
   resolvedSelFltr <- convAnnBoolExpPartialSQL sessVarBldr $
                      spiFilter selPerm
@@ -108,9 +110,10 @@ validateCountQWith sessVarBldr prepValBldr (CountQuery qt mDistCols mWhere) = do
 
 validateCountQ
   :: (QErrM m, UserInfoM m, CacheRM m)
-  => SourceName -> CountQuery -> m (CountQueryP1, DS.Seq Q.PrepArg)
-validateCountQ source query = do
-  tableCache <- askTableCache source
+  => CountQuery -> m (CountQueryP1, DS.Seq Q.PrepArg)
+validateCountQ query = do
+  let source = cqSource query
+  tableCache :: TableCache ('Postgres 'Vanilla) <- askTableCache source
   flip runTableCacheRT (source, tableCache) $ runDMLP1T $
     validateCountQWith sessVarFromCurrentSetting binRHSBuilder query
 
@@ -129,9 +132,9 @@ countQToTx (u, p) = do
 runCount
   :: ( QErrM m, UserInfoM m, CacheRM m
      , MonadIO m, MonadBaseControl IO m
-     , Tracing.MonadTrace m
+     , Tracing.MonadTrace m, MetadataM m
      )
-  => SourceName -> CountQuery -> m EncJSON
-runCount source q = do
-  sourceConfig <- _pcConfiguration <$> askPGSourceCache source
-  validateCountQ source q >>=  liftEitherM . runExceptT . runQueryLazyTx (_pscExecCtx sourceConfig) Q.ReadOnly . countQToTx
+  => CountQuery -> m EncJSON
+runCount q = do
+  sourceConfig <- askSourceConfig @('Postgres 'Vanilla) (cqSource q)
+  validateCountQ q >>= runQueryLazyTx (_pscExecCtx sourceConfig) Q.ReadOnly . countQToTx

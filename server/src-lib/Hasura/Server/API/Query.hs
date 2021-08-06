@@ -1,25 +1,30 @@
 -- | The RQL query ('/v1/query')
-{-# LANGUAGE NamedFieldPuns #-}
+
 module Hasura.Server.API.Query where
 
-import           Control.Lens
-import           Control.Monad.Trans.Control        (MonadBaseControl)
+import           Hasura.Prelude
+
+import qualified Data.Environment                    as Env
+import qualified Database.PG.Query                   as Q
+import qualified Network.HTTP.Client                 as HTTP
+
+import           Control.Monad.Trans.Control         (MonadBaseControl)
 import           Control.Monad.Unique
 import           Data.Aeson
 import           Data.Aeson.Casing
 import           Data.Aeson.TH
+import           Network.HTTP.Client.Extended
 
-import qualified Data.Environment                   as Env
-import qualified Data.HashMap.Strict                as HM
-import qualified Database.PG.Query                  as Q
-import qualified Network.HTTP.Client                as HTTP
+import qualified Hasura.Tracing                      as Tracing
 
+import           Hasura.Backends.Postgres.DDL.RunSQL
+import           Hasura.Base.Error
 import           Hasura.EncJSON
 import           Hasura.Metadata.Class
-import           Hasura.Prelude
 import           Hasura.RQL.DDL.Action
 import           Hasura.RQL.DDL.ComputedField
 import           Hasura.RQL.DDL.CustomTypes
+import           Hasura.RQL.DDL.Endpoint
 import           Hasura.RQL.DDL.EventTrigger
 import           Hasura.RQL.DDL.Metadata
 import           Hasura.RQL.DDL.Permission
@@ -38,46 +43,48 @@ import           Hasura.RQL.DML.Types
 import           Hasura.RQL.DML.Update
 import           Hasura.RQL.Types
 import           Hasura.RQL.Types.Run
-import           Hasura.Server.Types                (InstanceId (..))
+import           Hasura.Server.Types
 import           Hasura.Server.Utils
-import           Hasura.Server.Version              (HasVersion)
+import           Hasura.Server.Version               (HasVersion)
 import           Hasura.Session
 
-import qualified Hasura.Tracing                     as Tracing
+import           Hasura.GraphQL.Execute.Backend
+
 
 data RQLQueryV1
-  = RQAddExistingTableOrView !TrackTable
-  | RQTrackTable !TrackTable
-  | RQUntrackTable !UntrackTable
+  = RQAddExistingTableOrView !(TrackTable ('Postgres 'Vanilla))
+  | RQTrackTable !(TrackTable ('Postgres 'Vanilla))
+  | RQUntrackTable !(UntrackTable ('Postgres 'Vanilla))
   | RQSetTableIsEnum !SetTableIsEnum
+  | RQSetTableCustomization !(SetTableCustomization ('Postgres 'Vanilla))
 
-  | RQTrackFunction !TrackFunction
-  | RQUntrackFunction !UnTrackFunction
+  | RQTrackFunction !(TrackFunction ('Postgres 'Vanilla))
+  | RQUntrackFunction !(UnTrackFunction ('Postgres 'Vanilla))
 
-  | RQCreateObjectRelationship !CreateObjRel
-  | RQCreateArrayRelationship !CreateArrRel
-  | RQDropRelationship !DropRel
-  | RQSetRelationshipComment !SetRelComment
-  | RQRenameRelationship !RenameRel
+  | RQCreateObjectRelationship !(CreateObjRel ('Postgres 'Vanilla))
+  | RQCreateArrayRelationship !(CreateArrRel ('Postgres 'Vanilla))
+  | RQDropRelationship !(DropRel ('Postgres 'Vanilla))
+  | RQSetRelationshipComment !(SetRelComment ('Postgres 'Vanilla))
+  | RQRenameRelationship !(RenameRel ('Postgres 'Vanilla))
 
   -- computed fields related
-  | RQAddComputedField !AddComputedField
-  | RQDropComputedField !DropComputedField
+  | RQAddComputedField !(AddComputedField ('Postgres 'Vanilla))
+  | RQDropComputedField !(DropComputedField ('Postgres 'Vanilla))
 
-  | RQCreateRemoteRelationship !RemoteRelationship
-  | RQUpdateRemoteRelationship !RemoteRelationship
-  | RQDeleteRemoteRelationship !DeleteRemoteRelationship
+  | RQCreateRemoteRelationship !(RemoteRelationship ('Postgres 'Vanilla))
+  | RQUpdateRemoteRelationship !(RemoteRelationship ('Postgres 'Vanilla))
+  | RQDeleteRemoteRelationship !(DeleteRemoteRelationship ('Postgres 'Vanilla))
 
-  | RQCreateInsertPermission !(CreateInsPerm 'Postgres)
-  | RQCreateSelectPermission !(CreateSelPerm 'Postgres)
-  | RQCreateUpdatePermission !(CreateUpdPerm 'Postgres)
-  | RQCreateDeletePermission !(CreateDelPerm 'Postgres)
+  | RQCreateInsertPermission !(CreatePerm InsPerm ('Postgres 'Vanilla))
+  | RQCreateSelectPermission !(CreatePerm SelPerm ('Postgres 'Vanilla))
+  | RQCreateUpdatePermission !(CreatePerm UpdPerm ('Postgres 'Vanilla))
+  | RQCreateDeletePermission !(CreatePerm DelPerm ('Postgres 'Vanilla))
 
-  | RQDropInsertPermission !(DropPerm (InsPerm 'Postgres))
-  | RQDropSelectPermission !(DropPerm (SelPerm 'Postgres))
-  | RQDropUpdatePermission !(DropPerm (UpdPerm 'Postgres))
-  | RQDropDeletePermission !(DropPerm (DelPerm 'Postgres))
-  | RQSetPermissionComment !SetPermComment
+  | RQDropInsertPermission !(DropPerm InsPerm ('Postgres 'Vanilla))
+  | RQDropSelectPermission !(DropPerm SelPerm ('Postgres 'Vanilla))
+  | RQDropUpdatePermission !(DropPerm UpdPerm ('Postgres 'Vanilla))
+  | RQDropDeletePermission !(DropPerm DelPerm ('Postgres 'Vanilla))
+  | RQSetPermissionComment !(SetPermComment ('Postgres 'Vanilla))
 
   | RQGetInconsistentMetadata !GetInconsistentMetadata
   | RQDropInconsistentMetadata !DropInconsistentMetadata
@@ -91,18 +98,15 @@ data RQLQueryV1
 
   -- schema-stitching, custom resolver related
   | RQAddRemoteSchema !AddRemoteSchemaQuery
+  | RQUpdateRemoteSchema !AddRemoteSchemaQuery
   | RQRemoveRemoteSchema !RemoteSchemaNameQuery
   | RQReloadRemoteSchema !RemoteSchemaNameQuery
   | RQIntrospectRemoteSchema !RemoteSchemaNameQuery
 
-  -- remote-schema permissions
-  | RQAddRemoteSchemaPermissions !AddRemoteSchemaPermissions
-  | RQDropRemoteSchemaPermissions !DropRemoteSchemaPermissions
-
-  | RQCreateEventTrigger !CreateEventTriggerQuery
-  | RQDeleteEventTrigger !DeleteEventTriggerQuery
-  | RQRedeliverEvent     !RedeliverEventQuery
-  | RQInvokeEventTrigger !InvokeEventTriggerQuery
+  | RQCreateEventTrigger !(CreateEventTriggerQuery ('Postgres 'Vanilla))
+  | RQDeleteEventTrigger !(DeleteEventTriggerQuery ('Postgres 'Vanilla))
+  | RQRedeliverEvent     !(RedeliverEventQuery     ('Postgres 'Vanilla))
+  | RQInvokeEventTrigger !(InvokeEventTriggerQuery ('Postgres 'Vanilla))
 
   -- scheduled triggers
   | RQCreateCronTrigger !CreateCronTrigger
@@ -131,22 +135,22 @@ data RQLQueryV1
   | RQCreateActionPermission !CreateActionPermission
   | RQDropActionPermission !DropActionPermission
 
+  | RQCreateRestEndpoint !CreateEndpoint
+  | RQDropRestEndpoint !DropEndpoint
+
   | RQDumpInternalState !DumpInternalState
 
   | RQSetCustomTypes !CustomTypes
-  | RQSetTableCustomization !SetTableCustomization
-  deriving (Show, Eq)
 
 data RQLQueryV2
-  = RQV2TrackTable !TrackTableV2
+  = RQV2TrackTable !(TrackTableV2 ('Postgres 'Vanilla))
   | RQV2SetTableCustomFields !SetTableCustomFields -- deprecated
-  | RQV2TrackFunction !TrackFunctionV2
-  deriving (Show, Eq)
+  | RQV2TrackFunction !(TrackFunctionV2 ('Postgres 'Vanilla))
+  | RQV2ReplaceMetadata !ReplaceMetadataV2
 
 data RQLQuery
   = RQV1 !RQLQueryV1
   | RQV2 !RQLQueryV2
-  deriving (Show, Eq)
 
 instance FromJSON RQLQuery where
   parseJSON = withObject "Object" $ \o -> do
@@ -157,23 +161,13 @@ instance FromJSON RQLQuery where
       VIVersion1 -> RQV1 <$> parseJSON val
       VIVersion2 -> RQV2 <$> parseJSON val
 
-instance ToJSON RQLQuery where
-  toJSON = \case
-    RQV1 q -> embedVersion VIVersion1 $ toJSON q
-    RQV2 q -> embedVersion VIVersion2 $ toJSON q
-    where
-      embedVersion version (Object o) =
-        Object $ HM.insert "version" (toJSON version) o
-      -- never happens since JSON value of RQL queries are always objects
-      embedVersion _ _ = error "Unexpected: toJSON of RQL queries are not objects"
-
-$(deriveJSON
+$(deriveFromJSON
   defaultOptions { constructorTagModifier = snakeCase . drop 2
                  , sumEncoding = TaggedObject "type" "args"
                  }
   ''RQLQueryV1)
 
-$(deriveJSON
+$(deriveFromJSON
   defaultOptions { constructorTagModifier = snakeCase . drop 4
                  , sumEncoding = TaggedObject "type" "args"
                  , tagSingleConstructors = True
@@ -185,21 +179,15 @@ runQuery
   :: ( HasVersion, MonadIO m, Tracing.MonadTrace m
      , MonadBaseControl IO m, MonadMetadataStorage m
      , MonadResolveSource m
+     , MonadQueryTags m
      )
   => Env.Environment
   -> InstanceId
   -> UserInfo -> RebuildableSchemaCache -> HTTP.Manager
-  -> SQLGenCtx -> RemoteSchemaPermsCtx -> RQLQuery -> m (EncJSON, RebuildableSchemaCache)
-runQuery env instanceId userInfo sc hMgr sqlGenCtx remoteSchemaPermsCtx query = do
-  metadata <- fetchMetadata
-  let sources = scPostgres $ lastBuiltSchemaCache sc
-
-  (sourceName, _) <- case HM.toList sources of
-    []  -> throw400 NotSupported "no postgres source exist"
-    [s] -> pure $ second _pcConfiguration s
-    _   -> throw400 NotSupported "multiple postgres sources found"
-
-  result <- runQueryM env sourceName query & Tracing.interpTraceT \x -> do
+  -> ServerConfigCtx -> RQLQuery -> m (EncJSON, RebuildableSchemaCache)
+runQuery env instanceId userInfo sc hMgr serverConfigCtx query = do
+  (metadata, currentResourceVersion) <- fetchMetadata
+  result <- runQueryM env query & Tracing.interpTraceT \x -> do
     (((js, tracemeta), meta), rsc, ci) <-
          x & runMetadataT metadata
            & runCacheRWT sc
@@ -207,16 +195,20 @@ runQuery env instanceId userInfo sc hMgr sqlGenCtx remoteSchemaPermsCtx query = 
            & runExceptT
            & liftEitherM
     pure ((js, rsc, ci, meta), tracemeta)
-  withReload result
+  withReload currentResourceVersion result
   where
-    runCtx = RunCtx userInfo hMgr sqlGenCtx remoteSchemaPermsCtx
+    runCtx = RunCtx userInfo hMgr serverConfigCtx
 
-    withReload (result, updatedCache, invalidations, updatedMetadata) = do
+    withReload currentResourceVersion (result, updatedCache, invalidations, updatedMetadata) = do
       when (queryModifiesSchemaCache query) $ do
-        -- set modified metadata in storage
-        setMetadata updatedMetadata
-        -- notify schema cache sync
-        notifySchemaCacheSync instanceId invalidations
+        case (_sccMaintenanceMode serverConfigCtx) of
+          MaintenanceModeDisabled -> do
+            -- set modified metadata in storage
+            newResourceVersion <- setMetadata currentResourceVersion updatedMetadata
+            -- notify schema cache sync
+            notifySchemaCacheSync newResourceVersion instanceId invalidations
+          MaintenanceModeEnabled ->
+            throw500 "metadata cannot be modified in maintenance mode"
       pure (result, updatedCache)
 
 -- | A predicate that determines whether the given query might modify/rebuild the schema cache. If
@@ -269,12 +261,10 @@ queryModifiesSchemaCache (RQV1 qi) = case qi of
   RQCount _                       -> False
 
   RQAddRemoteSchema _             -> True
+  RQUpdateRemoteSchema _          -> True
   RQRemoveRemoteSchema _          -> True
   RQReloadRemoteSchema _          -> True
   RQIntrospectRemoteSchema _      -> False
-
-  RQAddRemoteSchemaPermissions _  -> True
-  RQDropRemoteSchemaPermissions _ -> True
 
   RQCreateEventTrigger _          -> True
   RQDeleteEventTrigger _          -> True
@@ -300,6 +290,9 @@ queryModifiesSchemaCache (RQV1 qi) = case qi of
   RQClearMetadata _               -> True
   RQReloadMetadata _              -> True
 
+  RQCreateRestEndpoint _          -> True
+  RQDropRestEndpoint _            -> True
+
   RQCreateAction _                -> True
   RQDropAction _                  -> True
   RQUpdateAction _                -> True
@@ -316,6 +309,7 @@ queryModifiesSchemaCache (RQV2 qi) = case qi of
   RQV2TrackTable _           -> True
   RQV2SetTableCustomFields _ -> True
   RQV2TrackFunction _        -> True
+  RQV2ReplaceMetadata _      -> True
 
 getQueryAccessMode :: (MonadError QErr m) => RQLQuery -> m Q.TxAccess
 getQueryAccessMode q = fromMaybe Q.ReadOnly <$> getQueryAccessMode' q
@@ -355,17 +349,17 @@ reconcileAccessModes (Just mode1) (Just mode2)
 runQueryM
   :: ( HasVersion, CacheRWM m, UserInfoM m
      , MonadBaseControl IO m, MonadIO m, MonadUnique m
-     , HasHttpManager m, HasSQLGenCtx m
-     , HasRemoteSchemaPermsCtx m
+     , HasHttpManagerM m
+     , HasServerConfigCtx m
      , Tracing.MonadTrace m
      , MetadataM m
      , MonadMetadataStorageQueryAPI m
+     , MonadQueryTags m
      )
   => Env.Environment
-  -> SourceName
   -> RQLQuery
   -> m EncJSON
-runQueryM env source rq = withPathK "args" $ case rq of
+runQueryM env rq = withPathK "args" $ case rq of
   RQV1 q -> runQueryV1M q
   RQV2 q -> runQueryV2M q
   where
@@ -374,12 +368,13 @@ runQueryM env source rq = withPathK "args" $ case rq of
       RQTrackTable q                  -> runTrackTableQ q
       RQUntrackTable q                -> runUntrackTableQ q
       RQSetTableIsEnum q              -> runSetExistingTableIsEnumQ q
+      RQSetTableCustomization q       -> runSetTableCustomization q
 
       RQTrackFunction q               -> runTrackFunc q
       RQUntrackFunction q             -> runUntrackFunc q
 
-      RQCreateObjectRelationship q    -> runCreateRelationship ObjRel q
-      RQCreateArrayRelationship  q    -> runCreateRelationship ArrRel q
+      RQCreateObjectRelationship q    -> runCreateRelationship ObjRel $ unCreateObjRel q
+      RQCreateArrayRelationship  q    -> runCreateRelationship ArrRel $ unCreateArrRel q
       RQDropRelationship  q           -> runDropRel q
       RQSetRelationshipComment  q     -> runSetRelComment q
       RQRenameRelationship q          -> runRenameRel q
@@ -401,19 +396,17 @@ runQueryM env source rq = withPathK "args" $ case rq of
       RQGetInconsistentMetadata q     -> runGetInconsistentMetadata q
       RQDropInconsistentMetadata q    -> runDropInconsistentMetadata q
 
-      RQInsert q                      -> runInsert env source q
-      RQSelect q                      -> runSelect source q
-      RQUpdate q                      -> runUpdate env source q
-      RQDelete q                      -> runDelete env source q
-      RQCount  q                      -> runCount source q
+      RQInsert q                      -> runInsert q
+      RQSelect q                      -> runSelect q
+      RQUpdate q                      -> runUpdate q
+      RQDelete q                      -> runDelete q
+      RQCount  q                      -> runCount q
 
       RQAddRemoteSchema    q          -> runAddRemoteSchema env q
+      RQUpdateRemoteSchema q          -> runUpdateRemoteSchema env q
       RQRemoveRemoteSchema q          -> runRemoveRemoteSchema q
       RQReloadRemoteSchema q          -> runReloadRemoteSchema q
       RQIntrospectRemoteSchema q      -> runIntrospectRemoteSchema q
-
-      RQAddRemoteSchemaPermissions q  -> runAddRemoteSchemaPermissions q
-      RQDropRemoteSchemaPermissions q -> runDropRemoteSchemaPermissions q
 
       RQCreateRemoteRelationship q    -> runCreateRemoteRelationship q
       RQUpdateRemoteRelationship q    -> runUpdateRemoteRelationship q
@@ -447,19 +440,22 @@ runQueryM env source rq = withPathK "args" $ case rq of
       RQCreateActionPermission q      -> runCreateActionPermission q
       RQDropActionPermission q        -> runDropActionPermission q
 
+      RQCreateRestEndpoint q          -> runCreateEndpoint q
+      RQDropRestEndpoint q            -> runDropEndpoint q
+
       RQDumpInternalState q           -> runDumpInternalState q
 
-      RQRunSql q                      -> runRunSQL defaultSource q
+      RQRunSql q                      -> runRunSQL @'Vanilla q
 
       RQSetCustomTypes q              -> runSetCustomTypes q
-      RQSetTableCustomization q       -> runSetTableCustomization q
 
-      RQBulk qs                       -> encJFromList <$> indexedMapM (runQueryM env source) qs
+      RQBulk qs                       -> encJFromList <$> indexedMapM (runQueryM env) qs
 
     runQueryV2M = \case
       RQV2TrackTable q           -> runTrackTableV2Q q
       RQV2SetTableCustomFields q -> runSetTableCustomFieldsQV2 q
       RQV2TrackFunction q        -> runTrackFunctionV2 q
+      RQV2ReplaceMetadata q      -> runReplaceMetadataV2 q
 
 requiresAdmin :: RQLQuery -> Bool
 requiresAdmin = \case
@@ -468,6 +464,7 @@ requiresAdmin = \case
     RQTrackTable _                  -> True
     RQUntrackTable _                -> True
     RQSetTableIsEnum _              -> True
+    RQSetTableCustomization _       -> True
 
     RQTrackFunction _               -> True
     RQUntrackFunction _             -> True
@@ -506,12 +503,10 @@ requiresAdmin = \case
     RQCount  _                      -> False
 
     RQAddRemoteSchema    _          -> True
+    RQUpdateRemoteSchema _          -> True
     RQRemoveRemoteSchema _          -> True
     RQReloadRemoteSchema _          -> True
     RQIntrospectRemoteSchema _      -> True
-
-    RQAddRemoteSchemaPermissions _  -> True
-    RQDropRemoteSchemaPermissions _ -> True
 
     RQCreateEventTrigger _          -> True
     RQDeleteEventTrigger _          -> True
@@ -535,6 +530,9 @@ requiresAdmin = \case
     RQExportMetadata _              -> True
     RQReloadMetadata _              -> True
 
+    RQCreateRestEndpoint _          -> True
+    RQDropRestEndpoint _            -> True
+
     RQCreateAction _                -> True
     RQDropAction _                  -> True
     RQUpdateAction _                -> True
@@ -543,7 +541,6 @@ requiresAdmin = \case
 
     RQDumpInternalState _           -> True
     RQSetCustomTypes _              -> True
-    RQSetTableCustomization _       -> True
 
     RQRunSql _                      -> True
 
@@ -553,3 +550,4 @@ requiresAdmin = \case
     RQV2TrackTable _           -> True
     RQV2SetTableCustomFields _ -> True
     RQV2TrackFunction _        -> True
+    RQV2ReplaceMetadata _      -> True

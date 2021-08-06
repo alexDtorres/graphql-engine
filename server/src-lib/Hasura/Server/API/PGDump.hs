@@ -4,23 +4,22 @@ module Hasura.Server.API.PGDump
   , execPGDump
   ) where
 
-import           Control.Exception      (IOException, try)
+import           Control.Exception     (IOException, try)
 import           Data.Aeson
-import           Data.Aeson.Casing
-import           Data.Aeson.TH
-import           Data.Char              (isSpace)
+import           Data.Char             (isSpace)
 import           Data.Text.Conversions
 import           Hasura.Prelude
-import           Hasura.RQL.Types       (SourceName, defaultSource)
+import           Hasura.RQL.Types      (SourceName, defaultSource)
 import           System.Exit
 import           System.Process
 
-import qualified Data.ByteString.Lazy   as BL
-import qualified Data.List              as L
-import qualified Data.Text              as T
-import qualified Database.PG.Query      as Q
-import qualified Hasura.RQL.Types.Error as RTE
-import qualified Text.Regex.TDFA        as TDFA
+import qualified Data.ByteString.Lazy  as BL
+import qualified Data.List             as L
+import qualified Data.Text             as T
+import qualified Database.PG.Query     as Q
+import qualified Hasura.Base.Error     as RTE
+import qualified Text.Regex.TDFA       as TDFA
+
 
 data PGDumpReqBody =
   PGDumpReqBody
@@ -29,14 +28,13 @@ data PGDumpReqBody =
   , prbCleanOutput :: !Bool
   } deriving (Show, Eq)
 
-$(deriveToJSON (aesonDrop 3 snakeCase) ''PGDumpReqBody)
-
 instance FromJSON PGDumpReqBody where
   parseJSON = withObject "Object" $ \o ->
     PGDumpReqBody
       <$> o .:? "source" .!= defaultSource
       <*> o .: "opts"
       <*> o .:? "clean_output" .!= False
+
 
 execPGDump
   :: (MonadError RTE.QErr m, MonadIO m)
@@ -83,7 +81,6 @@ execPGDump b ci = do
       , "SET client_encoding = 'UTF8';"
       , "SET standard_conforming_strings = on;"
       , "SELECT pg_catalog.set_config('search_path', '', false);"
-      , "SET check_function_bodies = false;"
       , "SET xmloption = content;"
       , "SET client_min_messages = warning;"
       , "SET row_security = off;"

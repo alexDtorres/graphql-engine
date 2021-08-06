@@ -1,5 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
-
 module Data.Environment
     ( Environment()
     , getEnvironment
@@ -7,6 +5,7 @@ module Data.Environment
     , emptyEnvironment
     , maybeEnvironment
     , lookupEnv
+    , redactEnv
     , Data.Environment.toList
     ) where
 
@@ -16,6 +15,7 @@ import           Hasura.Prelude
 import qualified Data.Map           as M
 import qualified System.Environment
 
+-- | Server process environment variables
 newtype Environment = Environment (M.Map String String) deriving (Eq, Show, Generic)
 
 instance FromJSON Environment
@@ -37,3 +37,6 @@ lookupEnv (Environment es) k = M.lookup k es
 
 toList :: Environment -> [(String, String)]
 toList (Environment e) = M.toList e
+
+redactEnv :: Environment -> Environment
+redactEnv (Environment e) = Environment $ fmap (const "******") e
